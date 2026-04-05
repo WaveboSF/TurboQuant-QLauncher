@@ -5,12 +5,22 @@ TurboQuant QLauncher v0.42     (c) WaveboSF 2026
 =============================================
 Model Switcher & Server Manager for llama-server with TurboQuant KV-Cache.
 
-v0.42 (2026-04-05): Added Context Size field next to Port.
-  Optional input, leave empty to use llama-server / model default.
-  Typed value is passed as  -c <ctx>  when starting the server.
-  Useful for accuracy benchmarks where filler-token tests need a known,
-  bounded context window (e.g. 8192) instead of the model's native
-  (e.g. Gemma 4 = 256K, which would reserve far too much KV VRAM).
+v0.42 (2026-04-05):
+  - Added Context Size field next to Port. Optional input, leave empty to
+    use llama-server / model default. Typed value is passed as  -c <ctx>
+    when starting the server. Useful for accuracy benchmarks where filler-
+    token tests need a known, bounded context window (e.g. 8192) instead
+    of the model's native (e.g. Gemma 4 = 256K, which would reserve far
+    too much KV VRAM).
+  - The same Ctx value is now also passed to `llama-bench` during bench
+    runs, so server start and benchmark are always consistent.
+  - Benchmark log file (`TurboQuant_Benchmark_results.md`) now gets a
+    full "Benchmark Environment" header block on first write, and each
+    individual entry now includes the ctx size in its heading so runs
+    with different context sizes remain distinguishable and comparable.
+  - The Run button now also starts the selected model on the selected GPU
+    when neither 'Benchmark' nor 'Bench All' is checked — previously it
+    would only warn. Double-click on a model row still works the same way.
 
 Standalone GUI with zero external dependencies.
 Uses only Python stdlib (tkinter/ttk) — runs anywhere Python runs.
@@ -841,7 +851,10 @@ class TurboQuantQLauncher(tk.Tk):
                                      width=50, height=24,
                                      command=self._bench_run)
         self._run_btn.pack(side="left", padx=(8, 1))
-        ToolTip(self._run_btn, "Start benchmark with selected KV × LA configs", t)
+        ToolTip(self._run_btn,
+                "Start the selected model on the selected GPU.\n"
+                "If 'Benchmark' or 'Bench All' is checked, runs a benchmark\n"
+                "with the selected KV × LA configs instead.", t)
 
         self._stop_btn = HoverButton(row, t, text="Stop", color=t.accent,
                                       width=50, height=24,
@@ -953,12 +966,16 @@ class TurboQuantQLauncher(tk.Tk):
                 btn.configure_btn(color=ACCENT_TURBO if m == cur_la else t.border)
 
     def _bench_run(self):
-        """Run button: start benchmark with selected configs."""
+        """Run button: start benchmark OR start model server (v0.42).
+
+        Behavior depends on the Benchmark/Bench All checkboxes:
+          - Bench All checked        → run full KV × LA benchmark matrix
+          - Benchmark checked        → run single benchmark (baseline + selected KV)
+          - Neither checked          → start the selected model on the selected GPU
+                                       (same effect as double-clicking the GPU row)
+        """
         if self._bench_thread and self._bench_thread.is_alive():
             self._log("Benchmark already running.", "warn")
-            return
-        if self.server_process:
-            self._log("Server is running — stop first (Escape)", "warn")
             return
         if self._sel_model < 0 or self._sel_model >= len(self.models):
             self._log("No model selected.", "warn")
@@ -972,6 +989,18 @@ class TurboQuantQLauncher(tk.Tk):
         gpu_key = gpu_row["key"]
         model = self.models[self._sel_model]
         is_cpu = (gpu_key == "CPU")
+
+        # v0.42: If no benchmark mode is active, treat Run as "start server"
+        # and delegate to the same handler the double-click uses.
+        bench_mode = self._bench_all_var.get() or self._bench_var.get()
+        if not bench_mode:
+            self._on_run_model(fn, gpu_key)
+            return
+
+        # Benchmark modes require no running server (shared VRAM / port conflicts)
+        if self.server_process:
+            self._log("Server is running — stop first (Escape)", "warn")
+            return
 
         # Resolve GPU display name
         if is_cpu:
@@ -1011,8 +1040,6 @@ class TurboQuantQLauncher(tk.Tk):
         elif self._bench_var.get():
             # Single benchmark mode
             self._run_bench_for_selection()
-        else:
-            self._log("Check 'Benchmark' or 'Bench All' first.", "warn")
 
     def _bench_stop(self):
         """Stop button: cancel running benchmark."""
@@ -1581,6 +1608,18 @@ class TurboQuantQLauncher(tk.Tk):
         if ctv:
             cmd.extend(["-ctv", ctv])
 
+        # v0.42: Pass -c <ctx> to llama-bench if user set the Ctx field.
+        # Empty field → llama-bench uses its internal default (≈2048).
+        # This keeps the Ctx field consistent between server start and benchmark.
+        ctx_raw = (self._ctx_var.get() or "").strip() if hasattr(self, "_ctx_var") else ""
+        if ctx_raw:
+            try:
+                ctx_val = int(ctx_raw)
+                if ctx_val > 0:
+                    cmd.extend(["-c", str(ctx_val)])
+            except ValueError:
+                pass  # silently ignore invalid values in bench path
+
         try:
             kw = {"capture_output": True, "timeout": 300,
                   "env": env, "stdin": subprocess.DEVNULL}
@@ -1752,8 +1791,22 @@ class TurboQuantQLauncher(tk.Tk):
         try:
             with open(bench_path, "a", encoding="utf-8") as f:
                 if is_new:
+                    # v0.42: Full benchmark environment header on first write.
+                    # Documents the run conditions so future readers (and the author)
+                    # can tell exactly how each number in this file was produced.
                     f.write("# TurboQuant Benchmark Log\n\n")
                     f.write("Persistent benchmark results from TurboQuant QLauncher.\n\n")
+                    f.write("## Benchmark Environment\n\n")
+                    f.write("- **Tool:** `llama-bench` (invoked by TurboQuant QLauncher)\n")
+                    f.write("- **pp:** 512 tokens (prefill test)\n")
+                    f.write("- **tg:** 128 tokens (decode test)\n")
+                    f.write("- **ngl:** 99 (all layers offloaded to GPU)\n")
+                    f.write("- **Environment:** `CUDA_DEVICE_ORDER=PCI_BUS_ID` "
+                            "(mandatory for mixed-arch GPU hosts)\n")
+                    f.write("- **ctx_size:** set per run — see each entry's heading "
+                            "(empty = `llama-bench` internal default, typically ~2048)\n")
+                    f.write("- **Logged by:** TurboQuant QLauncher "
+                            f"v{APP_VERSION} — https://github.com/WaveboSF/TurboQuant-QLauncher\n\n")
                     f.write("---\n\n")
 
                 # Detect CUDA build + driver info for benchmark header
@@ -1767,7 +1820,12 @@ class TurboQuantQLauncher(tk.Tk):
                 cuda_driver = detect_cuda_version()
                 driver_tag = f", Driver {cuda_driver}" if cuda_driver else ""
 
-                f.write(f"### {model.filename} — {gpu_label}, Build {build_tag}{driver_tag}, {ts}\n\n")
+                # v0.42: Include ctx_size in each entry heading so runs with different
+                # context sizes remain comparable and distinguishable.
+                ctx_raw = (self._ctx_var.get() or "").strip() if hasattr(self, "_ctx_var") else ""
+                ctx_tag = f", ctx={ctx_raw}" if ctx_raw else ", ctx=default"
+
+                f.write(f"### {model.filename} — {gpu_label}, Build {build_tag}{driver_tag}{ctx_tag}, {ts}\n\n")
                 f.write(_row(hdr) + "\n")
                 f.write(sep + "\n")
                 for r in rows:
