@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TurboQuant QLauncher v0.41     (c) WaveboSF 2026
+TurboQuant QLauncher v0.42     (c) WaveboSF 2026
 =============================================
 Model Switcher & Server Manager for llama-server with TurboQuant KV-Cache.
+
+v0.42 (2026-04-05): Added Context Size field next to Port.
+  Optional input, leave empty to use llama-server / model default.
+  Typed value is passed as  -c <ctx>  when starting the server.
+  Useful for accuracy benchmarks where filler-token tests need a known,
+  bounded context window (e.g. 8192) instead of the model's native
+  (e.g. Gemma 4 = 256K, which would reserve far too much KV VRAM).
 
 Standalone GUI with zero external dependencies.
 Uses only Python stdlib (tkinter/ttk) — runs anywhere Python runs.
@@ -44,7 +51,7 @@ from tkinter import ttk, messagebox, filedialog
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.41"
+APP_VERSION = "0.42"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -102,6 +109,7 @@ DEFAULT_CONFIG = {
     "llama_server_path": "",
     "kv_cache": "q8_0-K + turbo4-V",
     "port": 8080,
+    "ctx_size": "",  # v0.42: empty = use llama-server default, else passed as -c <ctx>
     "no_thinking": False,
     "benchmark": False,
     "bench_all": False,
@@ -766,6 +774,19 @@ class TurboQuantQLauncher(tk.Tk):
                               bg=t.entry_bg, fg=t.fg, relief="flat", bd=2,
                               insertbackground=t.fg)
         port_entry.pack(side="left", padx=(4, 0))
+
+        # v0.42: Context size field — passed as -c <ctx> when starting llama-server.
+        # Leave empty to use llama-server / model default (256K for Gemma 4 etc.).
+        ctx_label = tk.Label(row, text="  Ctx:", font=FONT_BODY_B, bg=t.bg, fg=t.fg)
+        ctx_label.pack(side="left", padx=(8, 0))
+        ToolTip(ctx_label, "Context size (-c). Leave empty to use llama-server / model default.\n"
+                           "Set e.g. 8192 for bounded accuracy tests on models with huge native\n"
+                           "context (Gemma 4 native = 256K → enormous KV VRAM reservation).", t)
+        self._ctx_var = tk.StringVar(value=str(self.cfg.get("ctx_size", "")))
+        ctx_entry = tk.Entry(row, textvariable=self._ctx_var, width=7, font=FONT_BODY,
+                             bg=t.entry_bg, fg=t.fg, relief="flat", bd=2,
+                             insertbackground=t.fg)
+        ctx_entry.pack(side="left", padx=(4, 0))
 
         self._no_think_var = tk.BooleanVar(value=self.cfg.get("no_thinking", False))
         cb_think = tk.Checkbutton(row, text="No Thinking", variable=self._no_think_var,
@@ -1848,6 +1869,17 @@ class TurboQuantQLauncher(tk.Tk):
         port = self._port_var.get()
         cmd.extend(["--host", "0.0.0.0", "--port", port])
 
+        # v0.42: Append -c <ctx> if user provided a context size.
+        # Empty field → llama-server uses its default (usually model native).
+        ctx_raw = (self._ctx_var.get() or "").strip()
+        if ctx_raw:
+            try:
+                ctx_val = int(ctx_raw)
+                if ctx_val > 0:
+                    cmd.extend(["-c", str(ctx_val)])
+            except ValueError:
+                self._log(f"Ignoring invalid Ctx value: {ctx_raw!r} (expected integer)", "warn")
+
         env = os.environ.copy()
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         if env_cuda is not None:
@@ -2298,6 +2330,7 @@ class TurboQuantQLauncher(tk.Tk):
     def _save_current_config(self):
         self.cfg["kv_cache"] = self._kv_var.get()
         self.cfg["port"] = int(self._port_var.get() or 8080)
+        self.cfg["ctx_size"] = (self._ctx_var.get() or "").strip()  # v0.42: persist Ctx field
         self.cfg["no_thinking"] = self._no_think_var.get()
         self.cfg["benchmark"] = self._bench_var.get()
         self.cfg["bench_all"] = self._bench_all_var.get()
