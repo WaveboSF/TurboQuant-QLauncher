@@ -1,26 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TurboQuant QLauncher v0.42     (c) WaveboSF 2026
+TurboQuant QLauncher v0.43     (c) WaveboSF 2026
 =============================================
 Model Switcher & Server Manager for llama-server with TurboQuant KV-Cache.
-
-v0.42 (2026-04-05):
-  - Added Context Size field next to Port. Optional input, leave empty to
-    use llama-server / model default. Typed value is passed as  -c <ctx>
-    when starting the server. Useful for accuracy benchmarks where filler-
-    token tests need a known, bounded context window (e.g. 8192) instead
-    of the model's native (e.g. Gemma 4 = 256K, which would reserve far
-    too much KV VRAM).
-  - The same Ctx value is now also passed to `llama-bench` during bench
-    runs, so server start and benchmark are always consistent.
-  - Benchmark log file (`TurboQuant_Benchmark_results.md`) now gets a
-    full "Benchmark Environment" header block on first write, and each
-    individual entry now includes the ctx size in its heading so runs
-    with different context sizes remain distinguishable and comparable.
-  - The Run button now also starts the selected model on the selected GPU
-    when neither 'Benchmark' nor 'Bench All' is checked — previously it
-    would only warn. Double-click on a model row still works the same way.
 
 Standalone GUI with zero external dependencies.
 Uses only Python stdlib (tkinter/ttk) — runs anywhere Python runs.
@@ -61,7 +44,7 @@ from tkinter import ttk, messagebox, filedialog
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.42"
+APP_VERSION = "0.43"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -113,6 +96,32 @@ def kv_effective_gb(model_gb: float, kv_name: str) -> float:
     """Return effective VRAM footprint: model weights + compressed KV overhead."""
     factor = KV_COMPRESSION.get(kv_name, 1.0)
     return model_gb * (1.0 + _KV_BASE_OVERHEAD * factor)
+
+# v0.43: Known reasoning-model families. Filename substring match (case
+# insensitive). When the "No Thinking" checkbox is active and a model whose
+# filename contains one of these substrings is started, the launcher warns
+# the user before launch. Gemma 4 26B-A4B math accuracy dropped from ~97%
+# to ~64% without thinking in our Discussion #20969 runs — hence this guard.
+# To extend: add lowercase substrings that reliably appear in the GGUF
+# filename of the affected family.
+REASONING_MODEL_HINTS = (
+    "gemma-4",
+    "gemma4",
+    "qwen3",
+    "qwq",
+    "deepseek-r1",
+    "deepseek_r1",
+    "magistral",
+    "-think",
+    "reasoning",
+)
+
+def _is_reasoning_model(filename: str) -> bool:
+    """Return True if the GGUF filename looks like a reasoning-capable model."""
+    if not filename:
+        return False
+    low = filename.lower()
+    return any(h in low for h in REASONING_MODEL_HINTS)
 
 DEFAULT_CONFIG = {
     "llm_models_path": "",
@@ -664,6 +673,15 @@ class TurboQuantQLauncher(tk.Tk):
         self._configure_theme()
         self._build_header()
         self._build_settings_bar()
+        # v0.43: Footer MUST be packed BEFORE the expanding PanedWindow.
+        # tkinter's pack manager gives "expand=True" widgets all remaining
+        # space at the moment they are packed. If the footer comes after
+        # the paned window, shrinking the window clips the footer first
+        # because the paned window has already claimed the entire area.
+        # By packing the footer with side="bottom" up front, tkinter
+        # reserves its fixed height, and the paned window only expands
+        # into what's left. Result: footer stays visible at any size.
+        self._build_footer()
         self._paned = tk.PanedWindow(self, orient=tk.VERTICAL,
                                       bg=self.theme.border,
                                       sashwidth=5, sashrelief="flat",
@@ -671,7 +689,6 @@ class TurboQuantQLauncher(tk.Tk):
         self._paned.pack(fill="both", expand=True, padx=16, pady=(4, 4))
         self._build_model_list()
         self._build_log_area()
-        self._build_footer()
         self._pending_bench = None  # (model, gpu_label, results, kv_name) — set after bench
 
         w = self.cfg.get("window_w", 1000)
@@ -730,10 +747,16 @@ class TurboQuantQLauncher(tk.Tk):
         ttk.Label(row1, text=f"v{APP_VERSION}", font=FONT_SMALL,
                   foreground=t.fg_dim, style="H.TLabel").pack(side="left", padx=(8, 0))
 
-        self._gpu_label = ttk.Label(hdr, text="Detecting GPUs...", font=FONT_SMALL,
+        # v0.43: Use " " (space) instead of empty string as placeholder text.
+        # tkinter gives a Label with text="" zero height — when the real
+        # text arrives asynchronously (_do_initial_scan, GPU detection),
+        # the label snaps to ~16px line height, pushing the separator,
+        # settings bar and paned window down. A single-space placeholder
+        # reserves the line height from the start, eliminating the jump.
+        self._gpu_label = ttk.Label(hdr, text=" ", font=FONT_SMALL,
                                      foreground=t.fg_secondary, style="H.TLabel")
         self._gpu_label.pack(fill="x", padx=16, pady=(0, 1))
-        self._cuda_label = ttk.Label(hdr, text="", font=FONT_SMALL,
+        self._cuda_label = ttk.Label(hdr, text=" ", font=FONT_SMALL,
                                       foreground=t.fg_dim, style="H.TLabel")
         self._cuda_label.pack(fill="x", padx=16, pady=(0, 6))
         ttk.Separator(self).pack(fill="x")
@@ -1139,9 +1162,13 @@ class TurboQuantQLauncher(tk.Tk):
 
     def _build_footer(self):
         t = self.theme
-        tk.Frame(self, height=1, bg=t.border).pack(fill="x")
+        # v0.43: side="bottom" anchors the footer to the window bottom edge
+        # and reserves its height BEFORE the paned window expands into the
+        # remaining space. This prevents the footer from being clipped when
+        # the user shrinks the window or when the model list grows.
         bar = ttk.Frame(self)
-        bar.pack(fill="x", padx=16, pady=(6, 8))
+        bar.pack(side="bottom", fill="x", padx=16, pady=(6, 8))
+        tk.Frame(self, height=1, bg=t.border).pack(side="bottom", fill="x")
 
         _BTN_W, _BTN_H = 130, 28
         HoverButton(bar, t, text="Rescan Models", color=ACCENT_SOFT,
@@ -1608,6 +1635,11 @@ class TurboQuantQLauncher(tk.Tk):
         if ctv:
             cmd.extend(["-ctv", ctv])
 
+        # v0.42: Auto-enable Flash Attention when either K or V cache is
+        # quantized (same rule as server start). Required by llama.cpp.
+        if (ctk and ctk != "f16") or (ctv and ctv != "f16"):
+            cmd.extend(["-fa", "1"])
+
         # v0.42: Pass -c <ctx> to llama-bench if user set the Ctx field.
         # Empty field → llama-bench uses its internal default (≈2048).
         # This keeps the Ctx field consistent between server start and benchmark.
@@ -1921,7 +1953,41 @@ class TurboQuantQLauncher(tk.Tk):
             if kv.get("ctv"):
                 cmd.extend(["-ctv", kv["ctv"]])
 
+        # v0.42: Auto-enable Flash Attention when either K or V cache is
+        # quantized (turbo2/3/4, q8_0, etc.). llama.cpp requires -fa for any
+        # quantized cache — without it, context init fails with
+        # "quantized V cache was requested, but this requires Flash Attention".
+        # Observed on Gemma 4 with turbo3/turbo3 specifically. For f16/f16
+        # runs we leave FA at its default so baseline behaviour is unchanged.
+        ctk = kv.get("ctk", "")
+        ctv = kv.get("ctv", "")
+        if (ctk and ctk != "f16") or (ctv and ctv != "f16"):
+            cmd.extend(["-fa", "on"])
+
         if self._no_think_var.get():
+            # v0.43: Guard against silently disabling thinking on reasoning
+            # models. Gemma 4 26B-A4B accuracy drops from ~97% to ~64% on
+            # the math suite when thinking is off — warn the user before
+            # launching. They can still proceed if it's intentional.
+            if _is_reasoning_model(filename):
+                proceed = messagebox.askyesno(
+                    "Reasoning Model — Thinking disabled",
+                    f"'{filename}' looks like a reasoning-capable model "
+                    f"(Gemma 4 / Qwen3 / DeepSeek-R1 / QwQ family).\n\n"
+                    f"'No Thinking' is currently ENABLED, which can drop "
+                    f"accuracy dramatically on math and logic tasks "
+                    f"(Gemma 4 26B: ~97% → ~64% on our suite).\n\n"
+                    f"Start the server with thinking disabled anyway?",
+                    icon="warning",
+                    default="no",
+                )
+                if not proceed:
+                    self._log(
+                        f"Server start cancelled by user — "
+                        f"'No Thinking' flag guard on reasoning model",
+                        "warn",
+                    )
+                    return
             cmd.extend(["--reasoning", "off"])
 
         port = self._port_var.get()
@@ -2078,6 +2144,12 @@ class TurboQuantQLauncher(tk.Tk):
 
     def _do_initial_scan(self):
         t = self.theme
+        # v0.43: Show the loading hint right when the scan starts. The
+        # initial label text is a placeholder space (reserves line height);
+        # setting it here means the first user-visible text transition is
+        # "Detecting GPUs..." → final text, and both have the same height.
+        self._gpu_label.config(text="Detecting GPUs...")
+        self.update_idletasks()
         self.gpus = detect_all_gpus()
         self._cpu_ram_gb = detect_cpu_ram_gb()
 
