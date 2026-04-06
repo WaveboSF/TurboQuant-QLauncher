@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TurboQuant QLauncher v0.44     (c) WaveboSF 2026
+TurboQuant QLauncher v0.45     (c) WaveboSF 2026
 =============================================
 Model Switcher & Server Manager for llama-server with TurboQuant KV-Cache.
 
@@ -44,7 +44,7 @@ from tkinter import ttk, messagebox, filedialog
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.44"
+APP_VERSION = "0.45"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -77,6 +77,17 @@ KV_CACHE_OPTIONS = {
     "q8_0-K + turbo3-V":   {"ctk": "q8_0",   "ctv": "turbo3"},
     "q8_0 / q8_0":         {"ctk": "q8_0",   "ctv": "q8_0"},
 }
+
+# v0.45: Context depth list for the Bench All matrix.
+# Each depth value is passed to llama-bench as `-d <n>`, which pre-fills the
+# KV-cache with N tokens before running the tg (decode) test. This reproduces
+# Madreag's and TheTom's published benchmark methodology from Discussion #20969
+# and directly exposes TurboQuant's long-context decode-speed advantage.
+#
+# With 6 KV × 4 LA × 3 depths = 72 runs per "Bench All" pass.
+# Edit here to add/remove depths. Keep 0 as the first entry (short-context
+# baseline) — it stays comparable to earlier benchmark entries in the log.
+BENCH_DEPTH_LIST = [0, 8192, 32768]
 
 # KV-Cache compression factor relative to f16 (1.0 = no compression).
 # K and V keys are compressed independently; factor = mean(K_ratio, V_ratio).
@@ -1081,16 +1092,38 @@ class TurboQuantQLauncher(tk.Tk):
                     break
 
         if self._bench_all_var.get() and self._bench_kv_set and self._bench_la_set:
-            # Bench All mode: KV × LA matrix
+            # v0.45: Bench All mode — KV × LA × Depth matrix
             kv_list = [k for k in KV_CACHE_OPTIONS if k in self._bench_kv_set]
             la_list = sorted(self._bench_la_set)
-            n_runs = len(kv_list) * len(la_list)
-            est_min = (n_runs * 45) // 60
-            est_sec = (n_runs * 45) % 60
+            depth_list = list(BENCH_DEPTH_LIST)
+            n_runs = len(kv_list) * len(la_list) * len(depth_list)
+
+            # Per-run estimate grows with model size and with depth (pre-fill
+            # dominates at d=32K for large models). Rough empirical rule:
+            #   base = 20s + 2s per GB model size (covers load + warmup + short test)
+            #   + per-depth: 0s @ d=0, 5–15s @ d=8K, 30–90s @ d=32K depending on model
+            model_gb = model.size_gb or 8.0
+            per_run_base = 20 + 2 * model_gb
+            depth_cost = 0.0
+            for d in depth_list:
+                if d == 0:
+                    depth_cost += 0
+                elif d <= 8192:
+                    depth_cost += 5 + 0.6 * model_gb
+                else:  # 32K and above
+                    depth_cost += 20 + 2.2 * model_gb
+            # Average per-run seconds: base + (total depth cost / n_depths)
+            avg_per_run = per_run_base + (depth_cost / max(1, len(depth_list)))
+            total_sec = int(n_runs * avg_per_run)
+            est_min = total_sec // 60
+            est_sec = total_sec % 60
+
+            depths_str = ", ".join(str(d) for d in depth_list)
             msg = (f"Run Benchmark ALL?\n\n"
                    f"Model: {model.filename}\n"
                    f"Target: {gpu_display}\n"
-                   f"KV configs: {len(kv_list)}   LA modes: {len(la_list)}\n"
+                   f"KV configs: {len(kv_list)}   LA modes: {len(la_list)}   "
+                   f"Depths: {len(depth_list)} ({depths_str})\n"
                    f"Total runs: {n_runs}\n\n"
                    f"Estimated time: ~{est_min}m {est_sec}s")
             if not messagebox.askyesno("Benchmark All", msg):
@@ -1599,7 +1632,14 @@ class TurboQuantQLauncher(tk.Tk):
 
     def _run_benchmark_all(self, model: ModelInfo, gpu_key: str,
                             kv_list: list, la_list: list, is_cpu: bool):
-        """Background thread: run llama-bench for KV × LA matrix."""
+        """Background thread: run llama-bench for KV × LA × Depth matrix.
+
+        v0.45: Added Depth dimension. The outer loop is LA (groups runs for
+        log readability as before), the middle loop is depth (reproduces
+        Madreag's short/medium/long-context methodology), and the inner loop
+        is KV. Result keys use ``{kv}|LA=xx|d=N`` so the file writer can
+        group by LA and sub-group by depth.
+        """
         server_exe = self.cfg.get("llama_server_path", "")
         server_dir = os.path.dirname(server_exe)
         bench_exe = os.path.join(server_dir, "llama-bench.exe")
@@ -1612,7 +1652,8 @@ class TurboQuantQLauncher(tk.Tk):
         ngl = "0" if is_cpu else "99"
         results = {}
         step = 0
-        total = len(kv_list) * len(la_list)
+        depth_list = list(BENCH_DEPTH_LIST)
+        total = len(kv_list) * len(la_list) * len(depth_list)
 
         # Resolve GPU display name
         if is_cpu:
@@ -1641,34 +1682,43 @@ class TurboQuantQLauncher(tk.Tk):
             elif "TURBO_LAYER_ADAPTIVE" in env:
                 del env["TURBO_LAYER_ADAPTIVE"]
 
-            for kv_name in kv_list:
+            for depth in depth_list:
                 if self._bench_stop_event.is_set():
                     break
-                step += 1
-                kv = KV_CACHE_OPTIONS.get(kv_name, {})
-                ctk = kv.get("ctk")
-                ctv = kv.get("ctv")
 
+                depth_tag = f"d={depth}" if depth > 0 else "d=0"
                 self.after(0, self._log,
-                           f"  ▸ [{step}/{total}] {kv_name} ({la_tag})...", "info")
-                self.after(0, lambda s=step, t=total:
-                           self._status_label.config(
-                               text=f"● Bench All [{s}/{t}]...",
-                               fg=self.theme.yellow))
+                           f"  ─── {depth_tag} ───", "info")
 
-                result = self._exec_bench(bench_exe, model.path, ngl, ctk, ctv, env)
-                if result:
-                    key = f"{kv_name}|{la_tag}"
-                    results[key] = result
-                    pp_key = next((k for k in result if k.startswith("pp")), None)
-                    tg_key = next((k for k in result if k.startswith("tg")), None)
-                    pp = result.get(pp_key, "?") if pp_key else "?"
-                    tg = result.get(tg_key, "?") if tg_key else "?"
+                for kv_name in kv_list:
+                    if self._bench_stop_event.is_set():
+                        break
+                    step += 1
+                    kv = KV_CACHE_OPTIONS.get(kv_name, {})
+                    ctk = kv.get("ctk")
+                    ctv = kv.get("ctv")
+
                     self.after(0, self._log,
-                               f"    {pp_key or 'pp'}={pp}, "
-                               f"{tg_key or 'tg'}={tg} t/s", "good")
-                else:
-                    self.after(0, self._log, f"    FAILED", "error")
+                               f"  ▸ [{step}/{total}] {kv_name} ({la_tag}, {depth_tag})...", "info")
+                    self.after(0, lambda s=step, t=total:
+                               self._status_label.config(
+                                   text=f"● Bench All [{s}/{t}]...",
+                                   fg=self.theme.yellow))
+
+                    result = self._exec_bench(bench_exe, model.path, ngl,
+                                              ctk, ctv, env, depth=depth)
+                    if result:
+                        key = f"{kv_name}|{la_tag}|{depth_tag}"
+                        results[key] = result
+                        pp_key = next((k for k in result if k.startswith("pp")), None)
+                        tg_key = next((k for k in result if k.startswith("tg")), None)
+                        pp = result.get(pp_key, "?") if pp_key else "?"
+                        tg = result.get(tg_key, "?") if tg_key else "?"
+                        self.after(0, self._log,
+                                   f"    {pp_key or 'pp'}={pp}, "
+                                   f"{tg_key or 'tg'}={tg} t/s", "good")
+                    else:
+                        self.after(0, self._log, f"    FAILED", "error")
 
         if results:
             gpu_label = "CPU" if is_cpu else gpu_key
@@ -1757,8 +1807,18 @@ class TurboQuantQLauncher(tk.Tk):
         self.after(0, self._bench_finished, results)
 
     def _exec_bench(self, bench_exe: str, model_path: str, ngl: str,
-                     ctk: Optional[str], ctv: Optional[str], env: dict) -> Optional[dict]:
-        """Execute llama-bench and parse output. Returns {pp512: str, tg128: str} or None."""
+                     ctk: Optional[str], ctv: Optional[str], env: dict,
+                     depth: int = 0) -> Optional[dict]:
+        """Execute llama-bench and parse output. Returns {pp512: str, tg128: str} or None.
+
+        v0.45: ``depth`` is passed as ``-d <n>`` to llama-bench. This pre-fills
+        the KV-cache with N tokens before the tg test, simulating long-context
+        decode. Replaces the broken v0.42 ``-c`` path: vanilla llama-bench has
+        no ``-c`` / ``--ctx-size`` switch — every fork we tested (mainline,
+        gemma4, thetom, madreag) rejects it with ``error: invalid parameter
+        for argument: -c``. The Ctx field in the GUI is for server-start only
+        and is now ignored in the benchmark path.
+        """
         cmd = [bench_exe, "-m", model_path, "-ngl", ngl]
         if ctk:
             cmd.extend(["-ctk", ctk])
@@ -1770,17 +1830,10 @@ class TurboQuantQLauncher(tk.Tk):
         if (ctk and ctk != "f16") or (ctv and ctv != "f16"):
             cmd.extend(["-fa", "1"])
 
-        # v0.42: Pass -c <ctx> to llama-bench if user set the Ctx field.
-        # Empty field → llama-bench uses its internal default (≈2048).
-        # This keeps the Ctx field consistent between server start and benchmark.
-        ctx_raw = (self._ctx_var.get() or "").strip() if hasattr(self, "_ctx_var") else ""
-        if ctx_raw:
-            try:
-                ctx_val = int(ctx_raw)
-                if ctx_val > 0:
-                    cmd.extend(["-c", str(ctx_val)])
-            except ValueError:
-                pass  # silently ignore invalid values in bench path
+        # v0.45: Pre-fill depth for tg (decode) test. -d 0 is llama-bench
+        # default and matches legacy short-context behavior.
+        if depth and depth > 0:
+            cmd.extend(["-d", str(depth)])
 
         try:
             kw = {"capture_output": True, "timeout": 300,
@@ -1862,46 +1915,59 @@ class TurboQuantQLauncher(tk.Tk):
                 return "—"
 
         # ── Bench All mode (keys contain "|LA=") ──
+        # v0.45: Keys now have format "{kv}|LA=xx|d=N" (three-dimensional).
+        # Legacy two-part keys "{kv}|LA=xx" are still accepted as d=0.
         is_bench_all = kv_name == "ALL" and any("|" in k for k in results)
 
         if is_bench_all:
-            # Group by LA tag, find f16 baseline per group
+            # Group by LA tag, then sub-group by depth. Find f16 baseline per
+            # (LA, depth) combination so Δ% stays meaningful across contexts.
             from collections import OrderedDict
-            groups = OrderedDict()
+            groups: "OrderedDict[str, OrderedDict[str, list]]" = OrderedDict()
             for key, data in results.items():
-                parts = key.split("|", 1)
+                parts = key.split("|")
                 kv_part = parts[0]
                 la_part = parts[1] if len(parts) > 1 else ""
-                groups.setdefault(la_part, []).append((kv_part, data))
+                depth_part = parts[2] if len(parts) > 2 else "d=0"
+                groups.setdefault(la_part, OrderedDict()) \
+                      .setdefault(depth_part, []).append((kv_part, data))
 
             rows = []
-            first_group = True
-            for la_tag, entries in groups.items():
-                # Find f16 baseline in this LA group
-                f16_pp, f16_tg = 0.0, 0.0
-                for kv_part, data in entries:
-                    if "f16" in kv_part:
-                        pp, tg = _get_pp_tg(data)
-                        try:
-                            f16_pp = float(pp.replace(",", ""))
-                            f16_tg = float(tg.replace(",", ""))
-                        except ValueError:
-                            pass
-                        break
-
+            first_la = True
+            for la_tag, depth_groups in groups.items():
+                if not first_la:
+                    rows.append(("", "", "", "", ""))  # blank separator row
                 if len(groups) > 1:
-                    if not first_group:
-                        rows.append(("", "", "", "", ""))  # empty separator row
                     rows.append((f"**{la_tag}**", "", "", "", ""))
-                    first_group = False
+                first_la = False
 
-                for kv_part, data in entries:
-                    pp, tg = _get_pp_tg(data)
-                    if "f16" in kv_part:
-                        rows.append((kv_part, pp, tg, "—", "—"))
-                    else:
-                        rows.append((kv_part, pp, tg,
-                                     _delta(pp, f16_pp), _delta(tg, f16_tg)))
+                first_depth = True
+                for depth_tag, entries in depth_groups.items():
+                    # Find f16 baseline in this (LA, depth) group
+                    f16_pp, f16_tg = 0.0, 0.0
+                    for kv_part, data in entries:
+                        if "f16" in kv_part:
+                            pp, tg = _get_pp_tg(data)
+                            try:
+                                f16_pp = float(pp.replace(",", ""))
+                                f16_tg = float(tg.replace(",", ""))
+                            except ValueError:
+                                pass
+                            break
+
+                    if not first_depth:
+                        rows.append(("", "", "", "", ""))  # blank between depths
+                    if len(depth_groups) > 1:
+                        rows.append((f"*{depth_tag}*", "", "", "", ""))
+                    first_depth = False
+
+                    for kv_part, data in entries:
+                        pp, tg = _get_pp_tg(data)
+                        if "f16" in kv_part:
+                            rows.append((kv_part, pp, tg, "—", "—"))
+                        else:
+                            rows.append((kv_part, pp, tg,
+                                         _delta(pp, f16_pp), _delta(tg, f16_tg)))
 
             hdr = ("KV-Cache", pp_col, tg_col, "Δ Prefill", "Δ Decode")
 
@@ -1965,8 +2031,10 @@ class TurboQuantQLauncher(tk.Tk):
                     f.write("- **ngl:** 99 (all layers offloaded to GPU)\n")
                     f.write("- **Environment:** `CUDA_DEVICE_ORDER=PCI_BUS_ID` "
                             "(mandatory for mixed-arch GPU hosts)\n")
-                    f.write("- **ctx_size:** set per run — see each entry's heading "
-                            "(empty = `llama-bench` internal default, typically ~2048)\n")
+                    f.write("- **Depth (`-d`):** pre-fills the KV-cache with N tokens "
+                            "before the tg test — Bench All mode iterates "
+                            f"{', '.join(str(d) for d in BENCH_DEPTH_LIST)} "
+                            "to expose long-context decode behavior\n")
                     f.write("- **Logged by:** TurboQuant QLauncher "
                             f"v{APP_VERSION} — https://github.com/WaveboSF/TurboQuant-QLauncher\n\n")
                     f.write("---\n\n")
@@ -1990,12 +2058,11 @@ class TurboQuantQLauncher(tk.Tk):
                 engine_name = slot_folder_name(self.cfg.get("llama_server_path", ""))
                 engine_tag = f", Engine {engine_name}" if engine_name and engine_name != build_tag else ""
 
-                # v0.42: Include ctx_size in each entry heading so runs with different
-                # context sizes remain comparable and distinguishable.
-                ctx_raw = (self._ctx_var.get() or "").strip() if hasattr(self, "_ctx_var") else ""
-                ctx_tag = f", ctx={ctx_raw}" if ctx_raw else ", ctx=default"
-
-                f.write(f"### {model.filename} — {gpu_label}, Build {build_tag}{driver_tag}{engine_tag}{ctx_tag}, {ts}\n\n")
+                # v0.45: ctx_size no longer appears in the heading — the Ctx
+                # GUI field is for server-start only and is ignored in the
+                # benchmark path. Depth is recorded per-row in the Bench All
+                # table via the ``*d=N*`` sub-headers.
+                f.write(f"### {model.filename} — {gpu_label}, Build {build_tag}{driver_tag}{engine_tag}, {ts}\n\n")
                 f.write(_row(hdr) + "\n")
                 f.write(sep + "\n")
                 for r in rows:
