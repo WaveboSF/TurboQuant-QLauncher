@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TurboQuant QLauncher v0.43     (c) WaveboSF 2026
+TurboQuant QLauncher v0.44     (c) WaveboSF 2026
 =============================================
 Model Switcher & Server Manager for llama-server with TurboQuant KV-Cache.
 
@@ -44,7 +44,7 @@ from tkinter import ttk, messagebox, filedialog
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.43"
+APP_VERSION = "0.44"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -123,9 +123,53 @@ def _is_reasoning_model(filename: str) -> bool:
     low = filename.lower()
     return any(h in low for h in REASONING_MODEL_HINTS)
 
+MAX_SERVER_SLOTS = 6  # v0.44: up to 6 quick-switch bookmark slots for llama-server.exe paths
+
+def slot_label_from_path(server_exe_path: str) -> str:
+    """Derive a short button label from a llama-server.exe path.
+
+    v0.44: Strip the common 'llama-server_' prefix from the parent folder name
+    so buttons stay compact. Examples:
+      G:\\...\\llama-server_thetom_cuda132\\llama-server.exe → 'thetom_cuda132'
+      G:\\...\\llama-server_gemma4_cuda132\\llama-server.exe → 'gemma4_cuda132'
+      G:\\...\\my_custom_build\\llama-server.exe            → 'my_custom_build'
+    Returns empty string for empty/invalid input.
+    """
+    if not server_exe_path:
+        return ""
+    try:
+        folder = os.path.basename(os.path.dirname(server_exe_path))
+    except Exception:
+        return ""
+    if not folder:
+        return ""
+    # Strip the "llama-server_" prefix if present (common pattern in Silvestar's setup)
+    low = folder.lower()
+    if low.startswith("llama-server_"):
+        return folder[len("llama-server_"):]
+    return folder
+
+def slot_folder_name(server_exe_path: str) -> str:
+    """Return just the parent folder name (no prefix stripping).
+
+    Used for benchmark log entries where we want the full, unambiguous
+    folder name — e.g. 'llama-server_thetom_cuda132' instead of 'thetom_cuda132'.
+    """
+    if not server_exe_path:
+        return ""
+    try:
+        return os.path.basename(os.path.dirname(server_exe_path))
+    except Exception:
+        return ""
+
 DEFAULT_CONFIG = {
     "llm_models_path": "",
     "llama_server_path": "",
+    # v0.44: Up to MAX_SERVER_SLOTS quick-switch bookmark paths to llama-server.exe
+    # builds. Empty strings = unused slots. Rendered as buttons in the footer next
+    # to "Update Binaries" for one-click switching between forks (mainline/TheTom/
+    # Gemma4/spiritbuun/etc.).
+    "server_slots": ["" for _ in range(MAX_SERVER_SLOTS)],
     "kv_cache": "q8_0-K + turbo4-V",
     "port": 8080,
     "ctx_size": "",  # v0.42: empty = use llama-server default, else passed as -c <ctx>
@@ -1178,6 +1222,14 @@ class TurboQuantQLauncher(tk.Tk):
                     width=_BTN_W, height=_BTN_H,
                     command=self._update_binaries).pack(side="left", padx=2)
 
+        # v0.44: Quick-switch slot buttons for bookmarked llama-server.exe paths.
+        # Populated dynamically from self.cfg["server_slots"]. Rebuilt whenever
+        # the paths dialog is saved or a slot is clicked (for active highlight).
+        # Small left margin to separate visually from "Update Binaries".
+        self._slot_bar = tk.Frame(bar, bg=t.bg)
+        self._slot_bar.pack(side="left", padx=(10, 0))
+        self._slot_buttons: list = []  # filled by _refresh_slot_buttons
+
         HoverButton(bar, t, text="About", color=ACCENT_SOFT,
                     width=80, height=_BTN_H,
                     command=self._show_about).pack(side="right", padx=2)
@@ -1190,6 +1242,84 @@ class TurboQuantQLauncher(tk.Tk):
                                             command=self._save_pending_bench)
         self._save_bench_btn.configure_btn(state="disabled")
         self._save_bench_btn.pack(side="right", padx=(2, 12))
+
+    # ─── v0.44: Engine Quick-Switch Slot Buttons ────────────────────────────
+
+    def _refresh_slot_buttons(self):
+        """Rebuild the quick-switch slot buttons from self.cfg['server_slots'].
+
+        Called after config changes (Paths dialog save) and after a slot click
+        (to update the active highlight). Only non-empty slots get a button.
+        The button whose path matches the currently active llama_server_path
+        is highlighted with the accent color; all others use ACCENT_SOFT.
+        """
+        t = self.theme
+        # Tear down existing buttons
+        for btn in getattr(self, "_slot_buttons", []):
+            try:
+                btn.destroy()
+            except Exception:
+                pass
+        self._slot_buttons = []
+
+        slots = self.cfg.get("server_slots") or []
+        active_path = (self.cfg.get("llama_server_path") or "").strip()
+        active_norm = os.path.normcase(os.path.normpath(active_path)) if active_path else ""
+
+        _BTN_H = 28
+        for slot_path in slots:
+            if not slot_path or not slot_path.strip():
+                continue
+            label = slot_label_from_path(slot_path)
+            if not label:
+                continue
+            # Width scales with label length. Base 20px padding + ~8px per char.
+            # Clamped to [90, 180] so very long names don't blow out the layout.
+            btn_w = max(90, min(180, len(label) * 8 + 20))
+
+            # Highlight active slot
+            slot_norm = os.path.normcase(os.path.normpath(slot_path))
+            is_active = (slot_norm == active_norm) and bool(active_norm)
+            color = t.accent if is_active else ACCENT_SOFT
+
+            # Missing-file indicator: still show the button, but in muted color
+            # so the user knows the slot is broken. Click will log an error.
+            if not os.path.isfile(slot_path):
+                color = t.border  # muted/disabled look
+
+            btn = HoverButton(self._slot_bar, t, text=label, color=color,
+                              width=btn_w, height=_BTN_H,
+                              command=lambda p=slot_path: self._on_slot_click(p))
+            btn.pack(side="left", padx=2)
+            ToolTip(btn, slot_path, theme=t)
+            self._slot_buttons.append(btn)
+
+    def _on_slot_click(self, slot_path: str):
+        """Switch the active llama-server.exe to the given slot path.
+
+        Refuses to switch while a server is running (must be stopped first).
+        Refreshes header info, DLL check, and model cards via _do_initial_scan.
+        """
+        if self.server_process:
+            self._log("Cannot switch engine: server is running. Stop it first.", "error")
+            return
+        if not slot_path or not os.path.isfile(slot_path):
+            self._log(f"Slot path not found: {slot_path}", "error")
+            return
+        # Already active? No-op.
+        current = (self.cfg.get("llama_server_path") or "").strip()
+        if current and os.path.normcase(os.path.normpath(current)) == \
+                      os.path.normcase(os.path.normpath(slot_path)):
+            self._log(f"Engine already active: {slot_label_from_path(slot_path)}", "info")
+            return
+
+        self.cfg["llama_server_path"] = slot_path
+        save_config(self.cfg)
+        label = slot_label_from_path(slot_path)
+        self._log(f"Switched engine → {label}", "good")
+        # Full refresh: re-detect CUDA build tag, DLL check, header, model scan,
+        # and slot highlighting. GPU list is re-probed too (cheap on modern drivers).
+        self._do_initial_scan()
 
     # ═══════════════════════════════════════════════════════════════════════
     # SECTION: Model Cards
@@ -1852,12 +1982,20 @@ class TurboQuantQLauncher(tk.Tk):
                 cuda_driver = detect_cuda_version()
                 driver_tag = f", Driver {cuda_driver}" if cuda_driver else ""
 
+                # v0.44: Engine folder name disambiguates forks that share the
+                # same CUDA build tag (e.g. three parallel cuda132 builds:
+                # mainline, TheTom, Gemma4-Fork). Only adds the tag when the
+                # folder name differs from the already-rendered build_tag to
+                # avoid redundancy for legacy single-build setups.
+                engine_name = slot_folder_name(self.cfg.get("llama_server_path", ""))
+                engine_tag = f", Engine {engine_name}" if engine_name and engine_name != build_tag else ""
+
                 # v0.42: Include ctx_size in each entry heading so runs with different
                 # context sizes remain comparable and distinguishable.
                 ctx_raw = (self._ctx_var.get() or "").strip() if hasattr(self, "_ctx_var") else ""
                 ctx_tag = f", ctx={ctx_raw}" if ctx_raw else ", ctx=default"
 
-                f.write(f"### {model.filename} — {gpu_label}, Build {build_tag}{driver_tag}{ctx_tag}, {ts}\n\n")
+                f.write(f"### {model.filename} — {gpu_label}, Build {build_tag}{driver_tag}{engine_tag}{ctx_tag}, {ts}\n\n")
                 f.write(_row(hdr) + "\n")
                 f.write(sep + "\n")
                 for r in rows:
@@ -2215,6 +2353,10 @@ class TurboQuantQLauncher(tk.Tk):
                 self._log(f"    from your CUDA installation to: {server_dir}", "info")
 
         self._rescan_models()
+        # v0.44: Refresh quick-switch slot buttons (updates active highlight
+        # when the current llama_server_path changes, e.g. after a slot click
+        # or a Paths dialog save).
+        self._refresh_slot_buttons()
 
     def _rescan_models(self):
         self.models = scan_models(self.cfg.get("llm_models_path", ""))
@@ -2255,7 +2397,7 @@ class TurboQuantQLauncher(tk.Tk):
         HoverButton(models_frame, t, text="...", color=t.border, width=36, height=24,
                     command=lambda: self._browse_dir(models_var)).pack(side="left", padx=(4, 0))
 
-        tk.Label(dlg, text="llama-server.exe Path:", font=FONT_BODY_B,
+        tk.Label(dlg, text="llama-server.exe Path (active):", font=FONT_BODY_B,
                  bg=t.bg, fg=t.fg).pack(padx=20, anchor="w")
         server_frame = tk.Frame(dlg, bg=t.bg)
         server_frame.pack(fill="x", padx=20, pady=(2, 8))
@@ -2265,6 +2407,54 @@ class TurboQuantQLauncher(tk.Tk):
         HoverButton(server_frame, t, text="...", color=t.border, width=36, height=24,
                     command=lambda: self._browse_file(server_var)).pack(side="left", padx=(4, 0))
 
+        # ── v0.44: Quick-switch slots ──
+        tk.Frame(dlg, height=1, bg=t.border).pack(fill="x", padx=16, pady=(4, 8))
+        tk.Label(dlg, text=f"Quick-Switch Slots (up to {MAX_SERVER_SLOTS}):",
+                 font=FONT_BODY_B, bg=t.bg, fg=t.fg).pack(padx=20, anchor="w")
+        tk.Label(dlg,
+                 text="Bookmark additional llama-server.exe builds here — "
+                      "they appear as one-click buttons in the footer.",
+                 font=FONT_BODY, bg=t.bg, fg=t.fg_dim,
+                 wraplength=680, justify="left").pack(padx=20, anchor="w", pady=(0, 4))
+
+        # Load current slots, pad to MAX_SERVER_SLOTS
+        current_slots = list(self.cfg.get("server_slots") or [])
+        while len(current_slots) < MAX_SERVER_SLOTS:
+            current_slots.append("")
+        slot_vars: list = []
+
+        # Keep a reference to the preview labels so they update live as the
+        # user types/browses. Each row: [Label preview] [Entry] [...]
+        slot_preview_labels: list = []
+
+        def _make_updater(var, label_widget):
+            def _update(*_):
+                preview = slot_label_from_path(var.get()) or "(empty)"
+                label_widget.config(text=preview)
+            return _update
+
+        for i in range(MAX_SERVER_SLOTS):
+            row = tk.Frame(dlg, bg=t.bg)
+            row.pack(fill="x", padx=20, pady=1)
+            # Fixed-width preview label on the left (shows derived button name)
+            preview_lbl = tk.Label(row, text="(empty)", font=FONT_BODY,
+                                    bg=t.bg, fg=t.fg_secondary,
+                                    width=18, anchor="w")
+            preview_lbl.pack(side="left", padx=(0, 6))
+            slot_preview_labels.append(preview_lbl)
+
+            var = tk.StringVar(value=current_slots[i])
+            slot_vars.append(var)
+            entry = ttk.Entry(row, textvariable=var, font=FONT_BODY)
+            entry.pack(side="left", fill="x", expand=True)
+            HoverButton(row, t, text="...", color=t.border, width=36, height=24,
+                        command=lambda v=var: self._browse_file(v)).pack(side="left", padx=(4, 0))
+
+            # Live preview update as the user types or browses
+            var.trace_add("write", _make_updater(var, preview_lbl))
+            # Initial preview render
+            preview_lbl.config(text=slot_label_from_path(var.get()) or "(empty)")
+
         tk.Frame(dlg, height=1, bg=t.border).pack(fill="x", padx=16, pady=8)
 
         btn_frame = tk.Frame(dlg, bg=t.bg)
@@ -2273,6 +2463,8 @@ class TurboQuantQLauncher(tk.Tk):
         def _save():
             self.cfg["llm_models_path"] = models_var.get()
             self.cfg["llama_server_path"] = server_var.get()
+            # v0.44: persist slot paths (strip whitespace, keep empty slots)
+            self.cfg["server_slots"] = [v.get().strip() for v in slot_vars]
             save_config(self.cfg)
             self._log("Paths saved.", "good")
             dlg.destroy()
@@ -2292,7 +2484,7 @@ class TurboQuantQLauncher(tk.Tk):
                     width=100, height=28, command=_cancel).pack(side="left", padx=8)
 
         dlg.update_idletasks()
-        self._center_window(dlg, 560, dlg.winfo_reqheight())
+        self._center_window(dlg, 720, dlg.winfo_reqheight())
 
     def _browse_dir(self, var: tk.StringVar):
         path = filedialog.askdirectory(initialdir=var.get())
