@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TurboQuant QLauncher v0.45     (c) WaveboSF 2026
+TurboQuant QLauncher v0.46     (c) WaveboSF 2026
 =============================================
 Model Switcher & Server Manager for llama-server with TurboQuant KV-Cache.
 
@@ -44,7 +44,7 @@ from tkinter import ttk, messagebox, filedialog
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.45"
+APP_VERSION = "0.46"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -184,6 +184,7 @@ DEFAULT_CONFIG = {
     "kv_cache": "q8_0-K + turbo4-V",
     "port": 8080,
     "ctx_size": "",  # v0.42: empty = use llama-server default, else passed as -c <ctx>
+    "bench_timeout": 90,  # v0.46: per-run timeout for llama-bench (seconds), see Timeout field
     "no_thinking": False,
     "benchmark": False,
     "bench_all": False,
@@ -875,6 +876,28 @@ class TurboQuantQLauncher(tk.Tk):
                              bg=t.entry_bg, fg=t.fg, relief="flat", bd=2,
                              insertbackground=t.fg)
         ctx_entry.pack(side="left", padx=(4, 0))
+
+        # v0.46: Per-run benchmark timeout (seconds). Replaces the previous
+        # hard-coded 300s in _exec_bench. 90s is the empirical sweet spot for
+        # 9B–27B models at depths up to 32K — long enough for healthy runs
+        # (max observed ~51s on Gemma 4 26B-A4B at d=32768) but tight enough
+        # to abort the broken turbo3/turbo3 path on the gemma4 fork (~80–100s)
+        # and any kernel timeouts. Increase manually to ~180–600s when
+        # benchmarking 70B+ models, then revert.
+        timeout_label = tk.Label(row, text="  Timeout:", font=FONT_BODY_B, bg=t.bg, fg=t.fg)
+        timeout_label.pack(side="left", padx=(8, 0))
+        ToolTip(timeout_label,
+                "Benchmark timeout per run, in seconds. Default 90s.\n"
+                "Range: 30–1800. Healthy 9B–27B runs finish in <60s; deep\n"
+                "contexts on 70B+ models may need 180–600s. Used only by\n"
+                "the benchmark path — server start is not affected.", t)
+        self._bench_timeout_var = tk.StringVar(
+            value=str(self.cfg.get("bench_timeout", 90)))
+        timeout_entry = tk.Entry(row, textvariable=self._bench_timeout_var,
+                                 width=5, font=FONT_BODY,
+                                 bg=t.entry_bg, fg=t.fg, relief="flat", bd=2,
+                                 insertbackground=t.fg)
+        timeout_entry.pack(side="left", padx=(4, 0))
 
         self._no_think_var = tk.BooleanVar(value=self.cfg.get("no_thinking", False))
         cb_think = tk.Checkbutton(row, text="No Thinking", variable=self._no_think_var,
@@ -1806,6 +1829,35 @@ class TurboQuantQLauncher(tk.Tk):
 
         self.after(0, self._bench_finished, results)
 
+    def _get_bench_timeout(self) -> int:
+        """Return the per-run benchmark timeout in seconds, validated.
+
+        v0.46: Reads from the GUI Timeout field. Falls back to 90 on any
+        invalid input (non-integer, out of range) and logs a warning so the
+        user can see why their custom value didn't take effect. Range is
+        clamped to [30, 1800] seconds — 30s is the floor below which even
+        small models can't load + run a single test, 1800s (30 min) is a
+        safety net against typos like "9000".
+        """
+        DEFAULT = 90
+        MIN_S, MAX_S = 30, 1800
+        raw = (self._bench_timeout_var.get() or "").strip() if hasattr(self, "_bench_timeout_var") else ""
+        if not raw:
+            return DEFAULT
+        try:
+            val = int(raw)
+        except ValueError:
+            self.after(0, self._log,
+                       f"Invalid Timeout value {raw!r} (expected integer 30–1800), using {DEFAULT}s",
+                       "warn")
+            return DEFAULT
+        if val < MIN_S or val > MAX_S:
+            self.after(0, self._log,
+                       f"Timeout {val}s out of range [{MIN_S}, {MAX_S}], using {DEFAULT}s",
+                       "warn")
+            return DEFAULT
+        return val
+
     def _exec_bench(self, bench_exe: str, model_path: str, ngl: str,
                      ctk: Optional[str], ctv: Optional[str], env: dict,
                      depth: int = 0) -> Optional[dict]:
@@ -1836,7 +1888,13 @@ class TurboQuantQLauncher(tk.Tk):
             cmd.extend(["-d", str(depth)])
 
         try:
-            kw = {"capture_output": True, "timeout": 300,
+            # v0.46: Per-run timeout is now configurable via the Timeout
+            # field in the GUI (default 90s). Replaces the v0.42 hard-coded
+            # 300s which was wasteful for healthy 9B–27B runs (max ~51s
+            # observed) and let the broken turbo3/turbo3 path on the gemma4
+            # fork eat 5 minutes per call before failing.
+            bench_timeout = self._get_bench_timeout()
+            kw = {"capture_output": True, "timeout": bench_timeout,
                   "env": env, "stdin": subprocess.DEVNULL}
             if sys.platform == "win32":
                 kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
@@ -2720,6 +2778,9 @@ class TurboQuantQLauncher(tk.Tk):
         self.cfg["kv_cache"] = self._kv_var.get()
         self.cfg["port"] = int(self._port_var.get() or 8080)
         self.cfg["ctx_size"] = (self._ctx_var.get() or "").strip()  # v0.42: persist Ctx field
+        # v0.46: Persist bench timeout. Stored as int (after validation),
+        # falls back to 90 if the user typed something invalid.
+        self.cfg["bench_timeout"] = self._get_bench_timeout()
         self.cfg["no_thinking"] = self._no_think_var.get()
         self.cfg["benchmark"] = self._bench_var.get()
         self.cfg["bench_all"] = self._bench_all_var.get()
