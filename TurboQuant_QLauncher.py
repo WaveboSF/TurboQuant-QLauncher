@@ -52,18 +52,26 @@ def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
 
     Works correctly for three execution modes:
-      1. python TurboQuant_QLauncher.py   → directory of the .py file
-      2. Nuitka --standalone              → directory of the .exe
-      3. Nuitka --onefile                 → directory of the .exe
+      1. python TurboQuant_QLauncher.py   -> directory of the .py file
+      2. Nuitka --standalone              -> directory of the .exe
+      3. Nuitka --onefile                 -> directory of the .exe
                                             (NOT the temp extraction dir)
 
-    Nuitka sets the global ``__compiled__`` and also ``sys.frozen = True``.
-    In --onefile mode ``__file__`` points to the temp dir, so we must use
-    ``sys.executable`` (which always holds the real exe path).
+    Per the official Nuitka manual (Onefile: Finding files), the only
+    reliable way to locate the user-facing .exe in --onefile mode is
+    ``__compiled__.containing_dir`` (Nuitka-specific, also works for
+    --standalone). Fallback is ``sys.argv[0]``, which Nuitka also sets
+    to the original executable path in onefile mode.
     """
-    if getattr(sys, "frozen", False) or globals().get("__compiled__"):
-        # Compiled by Nuitka (standalone or onefile)
-        return Path(sys.executable).resolve().parent
+    # Nuitka (standalone or onefile): __compiled__ is injected by Nuitka.
+    # .containing_dir is the directory of the user-facing .exe.
+    compiled = globals().get("__compiled__")
+    if compiled is not None and hasattr(compiled, "containing_dir"):
+        return Path(compiled.containing_dir).resolve()
+    # Nuitka fallback / PyInstaller: sys.argv[0] holds the original exe path
+    if getattr(sys, "frozen", False) or compiled is not None:
+        argv0 = sys.argv[0] if sys.argv and sys.argv[0] else sys.executable
+        return Path(argv0).resolve().parent
     # Plain Python interpreter
     return Path(__file__).resolve().parent
 
