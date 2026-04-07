@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/26528330/README.md)
 # TurboQuant QLauncher
 
 **Model Switcher & Benchmark Tool for llama-server with TurboQuant Compression**
