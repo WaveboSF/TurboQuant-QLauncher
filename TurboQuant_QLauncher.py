@@ -672,6 +672,14 @@ class ModelInfo:
     path: str
     size_bytes: int
     size_gb: float
+    # llama-bench's argument parser truncates paths at the first comma even
+    # when properly quoted (it uses commas as list separators for params like
+    # `-d 0,8192,32768` and is not context-aware). Models in such paths look
+    # like normal entries to llama-server but produce silent FAILED runs in
+    # llama-bench. Detected at scan time, surfaced in the UI with a warning
+    # marker, and refused with a clear error in _exec_bench. See investigation
+    # 2026-04-07: TheTom v2 + Qwen 27B from "Q:\AI, Deeplearning, ...".
+    has_unsafe_path: bool = False
 
 def scan_models(models_dirs, recursive: bool = True) -> List[ModelInfo]:
     """Scan one or more directories for *.gguf files.
@@ -715,6 +723,7 @@ def scan_models(models_dirs, recursive: bool = True) -> List[ModelInfo]:
                         path=full_path,
                         size_bytes=size,
                         size_gb=round(size / (1024**3), 1),
+                        has_unsafe_path=("," in full_path),
                     )
                 except OSError:
                     pass
@@ -1470,6 +1479,23 @@ class TurboQuantQLauncher(tk.Tk):
 
             hdr = tk.Frame(card, bg=bg)
             hdr.pack(fill="x", padx=10, pady=(6, 2))
+            # Warning marker for paths with commas: llama-bench will refuse to
+            # load these (its argparse truncates at the first comma). Surfaced
+            # here so the user understands why the bench would FAIL before
+            # they even click. Tooltip explains the cause.
+            if model.has_unsafe_path:
+                warn_lbl = tk.Label(hdr, text="⚠", font=FONT_BODY_B,
+                                     bg=bg, fg=t.red)
+                warn_lbl.pack(side="left", padx=(0, 4))
+                ToolTip(warn_lbl,
+                        "Path contains a comma — llama-bench will refuse this model.\n"
+                        "llama-bench's argument parser truncates paths at the first\n"
+                        "comma even when properly quoted (commas are used as list\n"
+                        "separators for parameters like -d 0,8192,32768).\n\n"
+                        "llama-server may still work with this model, but bench\n"
+                        "runs will fail silently. Move the model to a path without\n"
+                        "commas to enable benchmarking.\n\n"
+                        f"Path: {model.path}", t)
             tk.Label(hdr, text=model.filename, font=FONT_BODY_B,
                      bg=bg, fg=t.fg).pack(side="left")
             tk.Label(hdr, text=f"{model.size_gb} GB", font=FONT_BODY,
@@ -1935,6 +1961,25 @@ class TurboQuantQLauncher(tk.Tk):
         for argument: -c``. The Ctx field in the GUI is for server-start only
         and is now ignored in the benchmark path.
         """
+        # Refuse paths with commas — llama-bench's argument parser truncates
+        # them at the first comma even when properly quoted. Without this
+        # check the bench fails silently as "FAILED" with no diagnostic
+        # output, because llama-bench prints the actual error to stderr but
+        # the empty stdout produces an unparseable result. See investigation
+        # 2026-04-07: TheTom v2 + Qwen 27B from "Q:\AI, Deeplearning, ...".
+        if "," in model_path:
+            self.after(0, self._log,
+                "    Bench refused: model path contains a comma.", "error")
+            self.after(0, self._log,
+                "    llama-bench's argparse truncates paths at the first", "error")
+            self.after(0, self._log,
+                "    comma even when properly quoted. Move the model to a", "error")
+            self.after(0, self._log,
+                "    path without commas to enable benchmarking.", "error")
+            self.after(0, self._log,
+                f"    Path: {model_path}", "error")
+            return None
+
         cmd = [bench_exe, "-m", model_path, "-ngl", ngl]
         if ctk:
             cmd.extend(["-ctk", ctk])
@@ -2561,6 +2606,22 @@ class TurboQuantQLauncher(tk.Tk):
             mode = "recursive" if recursive else "top-level"
             self._log(f"Scan ({mode}): {len(self.models)} models in "
                       f"{len(paths)} dir(s) — {', '.join(paths)}", "info")
+        # Surface comma-in-path warnings once per scan so the user sees
+        # the issue at startup, not just when they try to bench. The
+        # affected models are also marked with ⚠ in the model list.
+        unsafe = [m for m in self.models if m.has_unsafe_path]
+        if unsafe:
+            self._log(
+                f"Warning: {len(unsafe)} model(s) live in paths with commas.",
+                "warn")
+            self._log(
+                "  llama-bench will refuse these — move them to a comma-free",
+                "warn")
+            self._log(
+                "  path to enable benchmarking. llama-server is unaffected.",
+                "warn")
+            for m in unsafe:
+                self._log(f"  ⚠ {m.filename}", "warn")
 
     # ═══════════════════════════════════════════════════════════════════════
     # SECTION: Dialogs
