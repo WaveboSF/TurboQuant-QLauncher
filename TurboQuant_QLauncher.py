@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TurboQuant QLauncher v0.46     (c) WaveboSF 2026
-=============================================
+TurboQuant QLauncher                            (c) WaveboSF 2026
+=================================================================
 Model Switcher & Server Manager for llama-server with TurboQuant KV-Cache.
 
 Standalone GUI with zero external dependencies.
 Uses only Python stdlib (tkinter/ttk) — runs anywhere Python runs.
 
 Features:
-- Auto-scan GGUF models from configurable directory
+- Auto-scan GGUF models from one or more configurable directories
 - Per-model GPU selector with VRAM fit indicator (Braille bars)
 - One-click model switching (auto-stops previous server)
-- KV-Cache config: f16, q8_0+turbo4, turbo3+turbo3, turbo4+turbo4
-- NVIDIA + AMD GPU detection (nvidia-smi, rocm-smi, WMI, lspci)
+- KV-Cache config: f16, q8_0+turbo4, turbo3+turbo3, turbo4+turbo4, etc.
+- NVIDIA + AMD + Intel + Apple GPU detection
+- Quick-switch slot bookmarks for multiple llama-server.exe builds
+- Bench All matrix mode (KV × LA × Depth) with configurable timeout
 - Server log output with timestamps
 - Persistent JSON config
 
@@ -44,7 +46,7 @@ from tkinter import ttk, messagebox, filedialog
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.46"
+APP_VERSION = "0.47"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -78,7 +80,7 @@ KV_CACHE_OPTIONS = {
     "q8_0 / q8_0":         {"ctk": "q8_0",   "ctv": "q8_0"},
 }
 
-# v0.45: Context depth list for the Bench All matrix.
+# Context depth list for the Bench All matrix.
 # Each depth value is passed to llama-bench as `-d <n>`, which pre-fills the
 # KV-cache with N tokens before running the tg (decode) test. This reproduces
 # Madreag's and TheTom's published benchmark methodology from Discussion #20969
@@ -108,7 +110,7 @@ def kv_effective_gb(model_gb: float, kv_name: str) -> float:
     factor = KV_COMPRESSION.get(kv_name, 1.0)
     return model_gb * (1.0 + _KV_BASE_OVERHEAD * factor)
 
-# v0.43: Known reasoning-model families. Filename substring match (case
+# Known reasoning-model families. Filename substring match (case
 # insensitive). When the "No Thinking" checkbox is active and a model whose
 # filename contains one of these substrings is started, the launcher warns
 # the user before launch. Gemma 4 26B-A4B math accuracy dropped from ~97%
@@ -134,12 +136,13 @@ def _is_reasoning_model(filename: str) -> bool:
     low = filename.lower()
     return any(h in low for h in REASONING_MODEL_HINTS)
 
-MAX_SERVER_SLOTS = 6  # v0.44: up to 6 quick-switch bookmark slots for llama-server.exe paths
+MAX_SERVER_SLOTS = 6  # up to 6 quick-switch bookmark slots for llama-server.exe paths
+MAX_MODELS_PATHS = 3  # up to 3 LLM model directories scanned together
 
 def slot_label_from_path(server_exe_path: str) -> str:
     """Derive a short button label from a llama-server.exe path.
 
-    v0.44: Strip the common 'llama-server_' prefix from the parent folder name
+    Strip the common 'llama-server_' prefix from the parent folder name
     so buttons stay compact. Examples:
       G:\\...\\llama-server_thetom_cuda132\\llama-server.exe → 'thetom_cuda132'
       G:\\...\\llama-server_gemma4_cuda132\\llama-server.exe → 'gemma4_cuda132'
@@ -174,17 +177,21 @@ def slot_folder_name(server_exe_path: str) -> str:
         return ""
 
 DEFAULT_CONFIG = {
-    "llm_models_path": "",
+    # Up to MAX_MODELS_PATHS LLM model directories. Empty strings = unused
+    # slots. The legacy single-path key "llm_models_path" is migrated into
+    # llm_models_paths[0] by load_config() for backward compatibility.
+    "llm_models_paths": ["" for _ in range(MAX_MODELS_PATHS)],
+    "llm_models_recursive": True,  # scan subdirectories of model paths
     "llama_server_path": "",
-    # v0.44: Up to MAX_SERVER_SLOTS quick-switch bookmark paths to llama-server.exe
+    # Up to MAX_SERVER_SLOTS quick-switch bookmark paths to llama-server.exe
     # builds. Empty strings = unused slots. Rendered as buttons in the footer next
     # to "Update Binaries" for one-click switching between forks (mainline/TheTom/
     # Gemma4/spiritbuun/etc.).
     "server_slots": ["" for _ in range(MAX_SERVER_SLOTS)],
     "kv_cache": "q8_0-K + turbo4-V",
     "port": 8080,
-    "ctx_size": "",  # v0.42: empty = use llama-server default, else passed as -c <ctx>
-    "bench_timeout": 90,  # v0.46: per-run timeout for llama-bench (seconds), see Timeout field
+    "ctx_size": "",  # empty = use llama-server default, else passed as -c <ctx>
+    "bench_timeout": 90,  # per-run timeout for llama-bench (seconds), see Timeout field
     "no_thinking": False,
     "benchmark": False,
     "bench_all": False,
@@ -658,25 +665,52 @@ class ModelInfo:
     size_bytes: int
     size_gb: float
 
-def scan_models(models_dir: str) -> List[ModelInfo]:
-    """Scan directory recursively for *.gguf files."""
-    models = []
-    if not os.path.isdir(models_dir):
-        return models
-    for root, dirs, files in os.walk(models_dir):
-        for f in files:
-            if f.lower().endswith(".gguf"):
+def scan_models(models_dirs, recursive: bool = True) -> List[ModelInfo]:
+    """Scan one or more directories for *.gguf files.
+
+    Accepts either a single path (str) or a list of paths. When
+    ``recursive`` is True (default), descends into subdirectories via
+    ``os.walk``; otherwise only the top level of each directory is scanned.
+    Results are deduplicated by canonical (realpath) location, so overlapping
+    directories or symlinks won't list the same file twice.
+    """
+    # Normalize input to a list of non-empty strings
+    if isinstance(models_dirs, str):
+        dirs = [models_dirs] if models_dirs else []
+    else:
+        dirs = [d for d in (models_dirs or []) if d]
+
+    seen: Dict[str, ModelInfo] = {}
+    for models_dir in dirs:
+        if not os.path.isdir(models_dir):
+            continue
+        if recursive:
+            walker = os.walk(models_dir)
+        else:
+            try:
+                entries = os.listdir(models_dir)
+            except OSError:
+                continue
+            walker = [(models_dir, [], entries)]
+        for root, _dirs, files in walker:
+            for f in files:
+                if not f.lower().endswith(".gguf"):
+                    continue
                 full_path = os.path.join(root, f)
                 try:
+                    key = os.path.realpath(full_path)
+                    if key in seen:
+                        continue
                     size = os.path.getsize(full_path)
-                    models.append(ModelInfo(
+                    seen[key] = ModelInfo(
                         filename=f,
                         path=full_path,
                         size_bytes=size,
                         size_gb=round(size / (1024**3), 1),
-                    ))
+                    )
                 except OSError:
                     pass
+    models = list(seen.values())
     models.sort(key=lambda m: m.size_bytes, reverse=True)
     return models
 
@@ -693,6 +727,21 @@ def load_config() -> dict:
                 cfg.update(saved)
     except Exception:
         pass
+    # migrate legacy single-path key to the new list-based field
+    legacy = cfg.get("llm_models_path")
+    if legacy:
+        paths = list(cfg.get("llm_models_paths") or [])
+        while len(paths) < MAX_MODELS_PATHS:
+            paths.append("")
+        if not any(p.strip() for p in paths):
+            paths[0] = legacy
+        cfg["llm_models_paths"] = paths
+        cfg.pop("llm_models_path", None)
+    # Ensure the list always has exactly MAX_MODELS_PATHS slots
+    paths = list(cfg.get("llm_models_paths") or [])
+    while len(paths) < MAX_MODELS_PATHS:
+        paths.append("")
+    cfg["llm_models_paths"] = paths[:MAX_MODELS_PATHS]
     return cfg
 
 def save_config(cfg: dict):
@@ -729,7 +778,7 @@ class TurboQuantQLauncher(tk.Tk):
         self._configure_theme()
         self._build_header()
         self._build_settings_bar()
-        # v0.43: Footer MUST be packed BEFORE the expanding PanedWindow.
+        # Footer MUST be packed BEFORE the expanding PanedWindow.
         # tkinter's pack manager gives "expand=True" widgets all remaining
         # space at the moment they are packed. If the footer comes after
         # the paned window, shrinking the window clips the footer first
@@ -803,7 +852,7 @@ class TurboQuantQLauncher(tk.Tk):
         ttk.Label(row1, text=f"v{APP_VERSION}", font=FONT_SMALL,
                   foreground=t.fg_dim, style="H.TLabel").pack(side="left", padx=(8, 0))
 
-        # v0.43: Use " " (space) instead of empty string as placeholder text.
+        # Use " " (space) instead of empty string as placeholder text.
         # tkinter gives a Label with text="" zero height — when the real
         # text arrives asynchronously (_do_initial_scan, GPU detection),
         # the label snaps to ~16px line height, pushing the separator,
@@ -864,7 +913,7 @@ class TurboQuantQLauncher(tk.Tk):
                               insertbackground=t.fg)
         port_entry.pack(side="left", padx=(4, 0))
 
-        # v0.42: Context size field — passed as -c <ctx> when starting llama-server.
+        # Context size field — passed as -c <ctx> when starting llama-server.
         # Leave empty to use llama-server / model default (256K for Gemma 4 etc.).
         ctx_label = tk.Label(row, text="  Ctx:", font=FONT_BODY_B, bg=t.bg, fg=t.fg)
         ctx_label.pack(side="left", padx=(8, 0))
@@ -877,7 +926,7 @@ class TurboQuantQLauncher(tk.Tk):
                              insertbackground=t.fg)
         ctx_entry.pack(side="left", padx=(4, 0))
 
-        # v0.46: Per-run benchmark timeout (seconds). Replaces the previous
+        # Per-run benchmark timeout (seconds). Replaces the previous
         # hard-coded 300s in _exec_bench. 90s is the empirical sweet spot for
         # 9B–27B models at depths up to 32K — long enough for healthy runs
         # (max observed ~51s on Gemma 4 26B-A4B at d=32768) but tight enough
@@ -1067,7 +1116,7 @@ class TurboQuantQLauncher(tk.Tk):
                 btn.configure_btn(color=ACCENT_TURBO if m == cur_la else t.border)
 
     def _bench_run(self):
-        """Run button: start benchmark OR start model server (v0.42).
+        """Run button: start benchmark OR start model server.
 
         Behavior depends on the Benchmark/Bench All checkboxes:
           - Bench All checked        → run full KV × LA benchmark matrix
@@ -1091,7 +1140,7 @@ class TurboQuantQLauncher(tk.Tk):
         model = self.models[self._sel_model]
         is_cpu = (gpu_key == "CPU")
 
-        # v0.42: If no benchmark mode is active, treat Run as "start server"
+        # If no benchmark mode is active, treat Run as "start server"
         # and delegate to the same handler the double-click uses.
         bench_mode = self._bench_all_var.get() or self._bench_var.get()
         if not bench_mode:
@@ -1115,7 +1164,7 @@ class TurboQuantQLauncher(tk.Tk):
                     break
 
         if self._bench_all_var.get() and self._bench_kv_set and self._bench_la_set:
-            # v0.45: Bench All mode — KV × LA × Depth matrix
+            # Bench All mode — KV × LA × Depth matrix
             kv_list = [k for k in KV_CACHE_OPTIONS if k in self._bench_kv_set]
             la_list = sorted(self._bench_la_set)
             depth_list = list(BENCH_DEPTH_LIST)
@@ -1262,7 +1311,7 @@ class TurboQuantQLauncher(tk.Tk):
 
     def _build_footer(self):
         t = self.theme
-        # v0.43: side="bottom" anchors the footer to the window bottom edge
+        # side="bottom" anchors the footer to the window bottom edge
         # and reserves its height BEFORE the paned window expands into the
         # remaining space. This prevents the footer from being clipped when
         # the user shrinks the window or when the model list grows.
@@ -1278,7 +1327,7 @@ class TurboQuantQLauncher(tk.Tk):
                     width=_BTN_W, height=_BTN_H,
                     command=self._update_binaries).pack(side="left", padx=2)
 
-        # v0.44: Quick-switch slot buttons for bookmarked llama-server.exe paths.
+        # Quick-switch slot buttons for bookmarked llama-server.exe paths.
         # Populated dynamically from self.cfg["server_slots"]. Rebuilt whenever
         # the paths dialog is saved or a slot is clicked (for active highlight).
         # Small left margin to separate visually from "Update Binaries".
@@ -1299,7 +1348,7 @@ class TurboQuantQLauncher(tk.Tk):
         self._save_bench_btn.configure_btn(state="disabled")
         self._save_bench_btn.pack(side="right", padx=(2, 12))
 
-    # ─── v0.44: Engine Quick-Switch Slot Buttons ────────────────────────────
+    # ─── Engine Quick-Switch Slot Buttons ────────────────────────────
 
     def _refresh_slot_buttons(self):
         """Rebuild the quick-switch slot buttons from self.cfg['server_slots'].
@@ -1397,7 +1446,14 @@ class TurboQuantQLauncher(tk.Tk):
                      font=FONT_BODY, bg=t.bg, fg=t.fg_dim).pack(pady=20)
             return
 
-        self._models_path_label.config(text=f"({self.cfg['llm_models_path']})")
+        paths = [p for p in (self.cfg.get("llm_models_paths") or []) if p]
+        if len(paths) == 0:
+            label_text = "(no directory configured)"
+        elif len(paths) == 1:
+            label_text = f"({paths[0]})"
+        else:
+            label_text = f"({' • '.join(paths)})"
+        self._models_path_label.config(text=label_text)
 
         for i, model in enumerate(self.models):
             bg = t.bg_secondary if i % 2 == 0 else t.bg
@@ -1657,7 +1713,7 @@ class TurboQuantQLauncher(tk.Tk):
                             kv_list: list, la_list: list, is_cpu: bool):
         """Background thread: run llama-bench for KV × LA × Depth matrix.
 
-        v0.45: Added Depth dimension. The outer loop is LA (groups runs for
+        Added Depth dimension. The outer loop is LA (groups runs for
         log readability as before), the middle loop is depth (reproduces
         Madreag's short/medium/long-context methodology), and the inner loop
         is KV. Result keys use ``{kv}|LA=xx|d=N`` so the file writer can
@@ -1832,7 +1888,7 @@ class TurboQuantQLauncher(tk.Tk):
     def _get_bench_timeout(self) -> int:
         """Return the per-run benchmark timeout in seconds, validated.
 
-        v0.46: Reads from the GUI Timeout field. Falls back to 90 on any
+        Reads from the GUI Timeout field. Falls back to 90 on any
         invalid input (non-integer, out of range) and logs a warning so the
         user can see why their custom value didn't take effect. Range is
         clamped to [30, 1800] seconds — 30s is the floor below which even
@@ -1863,9 +1919,9 @@ class TurboQuantQLauncher(tk.Tk):
                      depth: int = 0) -> Optional[dict]:
         """Execute llama-bench and parse output. Returns {pp512: str, tg128: str} or None.
 
-        v0.45: ``depth`` is passed as ``-d <n>`` to llama-bench. This pre-fills
+        ``depth`` is passed as ``-d <n>`` to llama-bench. This pre-fills
         the KV-cache with N tokens before the tg test, simulating long-context
-        decode. Replaces the broken v0.42 ``-c`` path: vanilla llama-bench has
+        decode. Replaces the broken ``-c`` path: vanilla llama-bench has
         no ``-c`` / ``--ctx-size`` switch — every fork we tested (mainline,
         gemma4, thetom, madreag) rejects it with ``error: invalid parameter
         for argument: -c``. The Ctx field in the GUI is for server-start only
@@ -1877,19 +1933,19 @@ class TurboQuantQLauncher(tk.Tk):
         if ctv:
             cmd.extend(["-ctv", ctv])
 
-        # v0.42: Auto-enable Flash Attention when either K or V cache is
+        # Auto-enable Flash Attention when either K or V cache is
         # quantized (same rule as server start). Required by llama.cpp.
         if (ctk and ctk != "f16") or (ctv and ctv != "f16"):
             cmd.extend(["-fa", "1"])
 
-        # v0.45: Pre-fill depth for tg (decode) test. -d 0 is llama-bench
+        # Pre-fill depth for tg (decode) test. -d 0 is llama-bench
         # default and matches legacy short-context behavior.
         if depth and depth > 0:
             cmd.extend(["-d", str(depth)])
 
         try:
-            # v0.46: Per-run timeout is now configurable via the Timeout
-            # field in the GUI (default 90s). Replaces the v0.42 hard-coded
+            # Per-run timeout is now configurable via the Timeout
+            # field in the GUI (default 90s). Replaces the hard-coded
             # 300s which was wasteful for healthy 9B–27B runs (max ~51s
             # observed) and let the broken turbo3/turbo3 path on the gemma4
             # fork eat 5 minutes per call before failing.
@@ -1973,7 +2029,7 @@ class TurboQuantQLauncher(tk.Tk):
                 return "—"
 
         # ── Bench All mode (keys contain "|LA=") ──
-        # v0.45: Keys now have format "{kv}|LA=xx|d=N" (three-dimensional).
+        # Keys now have format "{kv}|LA=xx|d=N" (three-dimensional).
         # Legacy two-part keys "{kv}|LA=xx" are still accepted as d=0.
         is_bench_all = kv_name == "ALL" and any("|" in k for k in results)
 
@@ -2077,7 +2133,7 @@ class TurboQuantQLauncher(tk.Tk):
         try:
             with open(bench_path, "a", encoding="utf-8") as f:
                 if is_new:
-                    # v0.42: Full benchmark environment header on first write.
+                    # Full benchmark environment header on first write.
                     # Documents the run conditions so future readers (and the author)
                     # can tell exactly how each number in this file was produced.
                     f.write("# TurboQuant Benchmark Log\n\n")
@@ -2108,7 +2164,7 @@ class TurboQuantQLauncher(tk.Tk):
                 cuda_driver = detect_cuda_version()
                 driver_tag = f", Driver {cuda_driver}" if cuda_driver else ""
 
-                # v0.44: Engine folder name disambiguates forks that share the
+                # Engine folder name disambiguates forks that share the
                 # same CUDA build tag (e.g. three parallel cuda132 builds:
                 # mainline, TheTom, Gemma4-Fork). Only adds the tag when the
                 # folder name differs from the already-rendered build_tag to
@@ -2116,7 +2172,7 @@ class TurboQuantQLauncher(tk.Tk):
                 engine_name = slot_folder_name(self.cfg.get("llama_server_path", ""))
                 engine_tag = f", Engine {engine_name}" if engine_name and engine_name != build_tag else ""
 
-                # v0.45: ctx_size no longer appears in the heading — the Ctx
+                # ctx_size no longer appears in the heading — the Ctx
                 # GUI field is for server-start only and is ignored in the
                 # benchmark path. Depth is recorded per-row in the Bench All
                 # table via the ``*d=N*`` sub-headers.
@@ -2216,7 +2272,7 @@ class TurboQuantQLauncher(tk.Tk):
             if kv.get("ctv"):
                 cmd.extend(["-ctv", kv["ctv"]])
 
-        # v0.42: Auto-enable Flash Attention when either K or V cache is
+        # Auto-enable Flash Attention when either K or V cache is
         # quantized (turbo2/3/4, q8_0, etc.). llama.cpp requires -fa for any
         # quantized cache — without it, context init fails with
         # "quantized V cache was requested, but this requires Flash Attention".
@@ -2228,7 +2284,7 @@ class TurboQuantQLauncher(tk.Tk):
             cmd.extend(["-fa", "on"])
 
         if self._no_think_var.get():
-            # v0.43: Guard against silently disabling thinking on reasoning
+            # Guard against silently disabling thinking on reasoning
             # models. Gemma 4 26B-A4B accuracy drops from ~97% to ~64% on
             # the math suite when thinking is off — warn the user before
             # launching. They can still proceed if it's intentional.
@@ -2256,7 +2312,7 @@ class TurboQuantQLauncher(tk.Tk):
         port = self._port_var.get()
         cmd.extend(["--host", "0.0.0.0", "--port", port])
 
-        # v0.42: Append -c <ctx> if user provided a context size.
+        # Append -c <ctx> if user provided a context size.
         # Empty field → llama-server uses its default (usually model native).
         ctx_raw = (self._ctx_var.get() or "").strip()
         if ctx_raw:
@@ -2407,7 +2463,7 @@ class TurboQuantQLauncher(tk.Tk):
 
     def _do_initial_scan(self):
         t = self.theme
-        # v0.43: Show the loading hint right when the scan starts. The
+        # Show the loading hint right when the scan starts. The
         # initial label text is a placeholder space (reserves line height);
         # setting it here means the first user-visible text transition is
         # "Detecting GPUs..." → final text, and both have the same height.
@@ -2478,18 +2534,25 @@ class TurboQuantQLauncher(tk.Tk):
                 self._log(f"    from your CUDA installation to: {server_dir}", "info")
 
         self._rescan_models()
-        # v0.44: Refresh quick-switch slot buttons (updates active highlight
+        # Refresh quick-switch slot buttons (updates active highlight
         # when the current llama_server_path changes, e.g. after a slot click
         # or a Paths dialog save).
         self._refresh_slot_buttons()
 
     def _rescan_models(self):
-        self.models = scan_models(self.cfg.get("llm_models_path", ""))
+        paths = [p for p in (self.cfg.get("llm_models_paths") or []) if p]
+        recursive = bool(self.cfg.get("llm_models_recursive", True))
+        self.models = scan_models(paths, recursive=recursive)
         self._models_header.config(
             text=f"Models ({len(self.models)} GGUF, "
                  f"{sum(m.size_gb for m in self.models):.0f} GB)")
         self._rebuild_model_cards()
-        self._log(f"Scan: {len(self.models)} models in {self.cfg['llm_models_path']}", "info")
+        if not paths:
+            self._log("Scan: no model directories configured.", "warn")
+        else:
+            mode = "recursive" if recursive else "top-level"
+            self._log(f"Scan ({mode}): {len(self.models)} models in "
+                      f"{len(paths)} dir(s) — {', '.join(paths)}", "info")
 
     # ═══════════════════════════════════════════════════════════════════════
     # SECTION: Dialogs
@@ -2512,15 +2575,43 @@ class TurboQuantQLauncher(tk.Tk):
                  bg=t.bg, fg=t.fg).pack(padx=20, pady=(12, 8), anchor="w")
         tk.Frame(dlg, height=1, bg=t.border).pack(fill="x", padx=16, pady=(0, 8))
 
-        tk.Label(dlg, text="LLM Models Directory:", font=FONT_BODY_B,
-                 bg=t.bg, fg=t.fg).pack(padx=20, anchor="w")
-        models_frame = tk.Frame(dlg, bg=t.bg)
-        models_frame.pack(fill="x", padx=20, pady=(2, 8))
-        models_var = tk.StringVar(value=self.cfg.get("llm_models_path", ""))
-        models_entry = ttk.Entry(models_frame, textvariable=models_var, font=FONT_BODY)
-        models_entry.pack(side="left", fill="x", expand=True)
-        HoverButton(models_frame, t, text="...", color=t.border, width=36, height=24,
-                    command=lambda: self._browse_dir(models_var)).pack(side="left", padx=(4, 0))
+        tk.Label(dlg, text=f"LLM Models Directories (up to {MAX_MODELS_PATHS}):",
+                 font=FONT_BODY_B, bg=t.bg, fg=t.fg).pack(padx=20, anchor="w")
+        tk.Label(dlg,
+                 text="All configured directories are scanned together. "
+                      "Duplicate files are detected automatically.",
+                 font=FONT_BODY, bg=t.bg, fg=t.fg_dim,
+                 wraplength=680, justify="left").pack(padx=20, anchor="w", pady=(0, 4))
+
+        # Load current model paths, pad to MAX_MODELS_PATHS
+        current_models_paths = list(self.cfg.get("llm_models_paths") or [])
+        while len(current_models_paths) < MAX_MODELS_PATHS:
+            current_models_paths.append("")
+        models_vars: list = []
+        for i in range(MAX_MODELS_PATHS):
+            row = tk.Frame(dlg, bg=t.bg)
+            row.pack(fill="x", padx=20, pady=1)
+            tk.Label(row, text=f"#{i + 1}", font=FONT_BODY,
+                     bg=t.bg, fg=t.fg_secondary,
+                     width=4, anchor="w").pack(side="left", padx=(0, 6))
+            mvar = tk.StringVar(value=current_models_paths[i])
+            models_vars.append(mvar)
+            mentry = ttk.Entry(row, textvariable=mvar, font=FONT_BODY)
+            mentry.pack(side="left", fill="x", expand=True)
+            HoverButton(row, t, text="...", color=t.border, width=36, height=24,
+                        command=lambda v=mvar: self._browse_dir(v)).pack(side="left", padx=(4, 0))
+
+        # Global recursive-scan checkbox
+        rec_row = tk.Frame(dlg, bg=t.bg)
+        rec_row.pack(fill="x", padx=20, pady=(6, 8))
+        recursive_var = tk.BooleanVar(value=bool(self.cfg.get("llm_models_recursive", True)))
+        cb_rec = tk.Checkbutton(rec_row,
+                                 text="Include subdirectories (recursive scan)",
+                                 variable=recursive_var,
+                                 font=FONT_BODY, bg=t.bg, fg=t.fg,
+                                 selectcolor=t.bg_secondary,
+                                 activebackground=t.bg, activeforeground=t.fg)
+        cb_rec.pack(side="left")
 
         tk.Label(dlg, text="llama-server.exe Path (active):", font=FONT_BODY_B,
                  bg=t.bg, fg=t.fg).pack(padx=20, anchor="w")
@@ -2532,7 +2623,7 @@ class TurboQuantQLauncher(tk.Tk):
         HoverButton(server_frame, t, text="...", color=t.border, width=36, height=24,
                     command=lambda: self._browse_file(server_var)).pack(side="left", padx=(4, 0))
 
-        # ── v0.44: Quick-switch slots ──
+        # ── Quick-switch slots ──
         tk.Frame(dlg, height=1, bg=t.border).pack(fill="x", padx=16, pady=(4, 8))
         tk.Label(dlg, text=f"Quick-Switch Slots (up to {MAX_SERVER_SLOTS}):",
                  font=FONT_BODY_B, bg=t.bg, fg=t.fg).pack(padx=20, anchor="w")
@@ -2586,9 +2677,16 @@ class TurboQuantQLauncher(tk.Tk):
         btn_frame.pack(fill="x", padx=20, pady=(0, 12))
 
         def _save():
-            self.cfg["llm_models_path"] = models_var.get()
+            # persist list of model paths + recursive flag
+            new_paths = [v.get().strip() for v in models_vars]
+            while len(new_paths) < MAX_MODELS_PATHS:
+                new_paths.append("")
+            self.cfg["llm_models_paths"] = new_paths[:MAX_MODELS_PATHS]
+            self.cfg["llm_models_recursive"] = bool(recursive_var.get())
+            # Drop the legacy single-path key if it's still hanging around
+            self.cfg.pop("llm_models_path", None)
             self.cfg["llama_server_path"] = server_var.get()
-            # v0.44: persist slot paths (strip whitespace, keep empty slots)
+            # persist slot paths (strip whitespace, keep empty slots)
             self.cfg["server_slots"] = [v.get().strip() for v in slot_vars]
             save_config(self.cfg)
             self._log("Paths saved.", "good")
@@ -2777,8 +2875,8 @@ class TurboQuantQLauncher(tk.Tk):
     def _save_current_config(self):
         self.cfg["kv_cache"] = self._kv_var.get()
         self.cfg["port"] = int(self._port_var.get() or 8080)
-        self.cfg["ctx_size"] = (self._ctx_var.get() or "").strip()  # v0.42: persist Ctx field
-        # v0.46: Persist bench timeout. Stored as int (after validation),
+        self.cfg["ctx_size"] = (self._ctx_var.get() or "").strip()  # persist Ctx field
+        # Persist bench timeout. Stored as int (after validation),
         # falls back to 90 if the user typed something invalid.
         self.cfg["bench_timeout"] = self._get_bench_timeout()
         self.cfg["no_thinking"] = self._no_think_var.get()
