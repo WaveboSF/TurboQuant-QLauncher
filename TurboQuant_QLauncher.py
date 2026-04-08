@@ -1252,6 +1252,7 @@ class TurboQuantQLauncher(tk.Tk):
         self._current_nut_profile: Optional[dict] = None
         self._active_mode: Optional[str] = None
         self._mode_buttons: dict = {}
+        self._mode_score_labels: dict = {}
         self._nut_rows_frame: Optional[tk.Frame] = None
         self._nut_phase2_placeholder: Optional[tk.Frame] = None
         # qnut v0.50 — concurrency guard. Set True at the very start of
@@ -1415,8 +1416,15 @@ class TurboQuantQLauncher(tk.Tk):
         # clicks one, the corresponding (kv, la) tuple from the profile
         # is applied to the KV/LA buttons via _select_kv / _select_la
         # so the user sees what the mode means.
+        #
+        # v0.50.2: each button gets a tiny score label above it (e.g.
+        # "3/3", "2/3") that shows the probe score of the anchor tuple
+        # that mode points to. The label is blank when no profile
+        # exists. This lets the user see — before clicking — exactly
+        # how faithful each mode is to the f16 baseline.
         mode_frame = tk.Frame(row, bg=t.bg)
         mode_frame.pack(side="left", padx=(8, 0))
+        self._mode_score_labels = {}
         for mode_key, mode_label, mode_tip in (
             ("quality", "Q",
              "Quality mode: highest fidelity, lowest compression "
@@ -1430,10 +1438,22 @@ class TurboQuantQLauncher(tk.Tk):
              "usable output. Use this for long contexts where you "
              "need every megabyte of KV cache space."),
         ):
-            btn = HoverButton(mode_frame, t, text=mode_label,
+            # Each mode gets its own vertical mini-frame: score label
+            # on top, button below. Frames are packed side-by-side so
+            # Q/N/C stay visually aligned as a group.
+            mini = tk.Frame(mode_frame, bg=t.bg)
+            mini.pack(side="left", padx=1)
+
+            score_lbl = tk.Label(mini, text=" ", font=FONT_SMALL,
+                                 bg=t.bg, fg=t.fg_dim, width=4,
+                                 anchor="center")
+            score_lbl.pack(side="top")
+            self._mode_score_labels[mode_key] = score_lbl
+
+            btn = HoverButton(mini, t, text=mode_label,
                               color=t.border, width=28, height=24,
                               command=lambda k=mode_key: self._apply_nut_mode(k))
-            btn.pack(side="left", padx=1)
+            btn.pack(side="top")
             ToolTip(btn, mode_tip, t)
             self._mode_buttons[mode_key] = btn
 
@@ -2638,24 +2658,69 @@ class TurboQuantQLauncher(tk.Tk):
           - the user clicks a mode button (active mode changes)
           - the user manually clicks a KV or LA button (active mode
             gets cleared because the user has wandered off the profile)
+
+        v0.50.2: also updates the tiny score labels above each button
+        (e.g. "3/3", "2/3") so the user can see at a glance how faithful
+        each mode is to the f16 baseline BEFORE clicking. Blank when no
+        profile exists.
         """
         if not hasattr(self, "_mode_buttons") or not self._mode_buttons:
             return
         t = self.theme
         has_profile = bool(self._current_nut_profile)
+
+        # Resolve the scores dict from the profile (string-keyed because
+        # JSON doesn't support tuple keys). Key format: "<kv>|LA<la>".
+        scores = {}
+        if has_profile:
+            scores = self._current_nut_profile.get("scores") or {}
+            if not isinstance(scores, dict):
+                scores = {}
+
         for mode_key, btn in self._mode_buttons.items():
+            score_lbl = self._mode_score_labels.get(mode_key)
+
             if not has_profile:
                 btn.configure_btn(color=t.border, state="disabled")
+                if score_lbl is not None:
+                    score_lbl.configure(text=" ", fg=t.fg_dim)
                 continue
+
             anchor = self._current_nut_profile.get(mode_key)
             if not isinstance(anchor, dict) or not anchor.get("kv"):
                 btn.configure_btn(color=t.border, state="disabled")
+                if score_lbl is not None:
+                    score_lbl.configure(text=" ", fg=t.fg_dim)
                 continue
+
             is_active = (self._active_mode == mode_key)
             btn.configure_btn(
                 color=ACCENT_TURBO if is_active else t.border,
                 state="normal",
             )
+
+            # Look up the score for this anchor's (kv, la) tuple. The
+            # quality anchor (f16, LA=0) is always 3/3 by definition
+            # even if it's not explicitly in the scores dict.
+            if score_lbl is not None:
+                kv = anchor["kv"]
+                la = int(anchor["la"])
+                score_key = f"{kv}|LA{la}"
+                score = scores.get(score_key)
+                if score is None and mode_key == "quality":
+                    # f16 baseline is always 3/3 by definition
+                    score = 3
+                if score is None:
+                    score_lbl.configure(text="?/3", fg=t.fg_dim)
+                else:
+                    # Color-code: 3/3 green, 2/3 amber, lower red
+                    if score >= 3:
+                        color = NUT_COLORS.get("good", t.green)
+                    elif score == 2:
+                        color = NUT_COLORS.get("suspect", "#d4a017")
+                    else:
+                        color = NUT_COLORS.get("rotten", t.red)
+                    score_lbl.configure(text=f"{score}/3", fg=color)
 
     def _clear_active_mode_if_user_drifted(self):
         """Reset _active_mode when the user manually changes KV or LA.
@@ -3207,7 +3272,7 @@ class TurboQuantQLauncher(tk.Tk):
                 cpu_fits = model.size_gb <= self._cpu_ram_gb * 0.7
                 row_data = self._create_gpu_row(
                     card, bg, HOVER_BG, model, i, len(gpu_rows), "CPU",
-                    "CPU RAM", t.fg_dim,
+                    "CPU RAM", t.green,
                     model.size_gb, self._cpu_ram_gb, cpu_fits)
                 gpu_rows.append(row_data)
 
