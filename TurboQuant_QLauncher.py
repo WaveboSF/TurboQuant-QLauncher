@@ -48,7 +48,7 @@ from tkinter import ttk, messagebox, filedialog
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.50"
+APP_VERSION = "0.51"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -87,6 +87,7 @@ KV_CACHE_OPTIONS = {
     "turbo3 / turbo3":     {"ctk": "turbo3",  "ctv": "turbo3"},
     "turbo4 / turbo4":     {"ctk": "turbo4",  "ctv": "turbo4"},
     "q8_0-K + turbo3-V":   {"ctk": "q8_0",   "ctv": "turbo3"},
+    "q8_0-K + turbo2-V":   {"ctk": "q8_0",   "ctv": "turbo2"},
     "q8_0 / q8_0":         {"ctk": "q8_0",   "ctv": "q8_0"},
 }
 
@@ -96,19 +97,27 @@ KV_CACHE_OPTIONS = {
 # Madreag's and TheTom's published benchmark methodology from Discussion #20969
 # and directly exposes TurboQuant's long-context decode-speed advantage.
 #
-# With 6 KV × 4 LA × 3 depths = 72 runs per "Bench All" pass.
+# With 7 KV × 4 LA × 3 depths = 84 runs per "Bench All" pass (v0.51: added
+# the q8_0-K + turbo2-V Boundary V config from TheTom's 08.04.2026 update).
 # Edit here to add/remove depths. Keep 0 as the first entry (short-context
 # baseline) — it stays comparable to earlier benchmark entries in the log.
 BENCH_DEPTH_LIST = [0, 8192, 32768]
 
 # KV-Cache compression factor relative to f16 (1.0 = no compression).
 # K and V keys are compressed independently; factor = mean(K_ratio, V_ratio).
-#   f16  = 1.0,  q8_0 = 0.5,  turbo4 = 0.25,  turbo3 = 0.20
+#   f16  = 1.0,  q8_0 = 0.5,  turbo4 = 0.25,  turbo3 = 0.20,  turbo2 = 0.156
+# Note: q8_0-K + turbo2-V is the "Boundary V" config from TheTom's
+# 08.04.2026 update — first 2 + last 2 layers protected at q8_0-V, rest
+# at turbo2-V. Activated via TURBO_LAYER_ADAPTIVE=7 (select LA=7 in the
+# launcher). Without LA=7 symmetric turbo2-V catastrophically degrades
+# PPL, so the Probe scoring system will correctly mark LA=0 combinations
+# for this KV as rotten.
 KV_COMPRESSION: Dict[str, float] = {
     "f16 (default)":     1.000,   # no compression
     "q8_0 / q8_0":       0.500,   # both halved
     "q8_0-K + turbo4-V": 0.375,   # mean(0.5, 0.25)
     "q8_0-K + turbo3-V": 0.350,   # mean(0.5, 0.20)
+    "q8_0-K + turbo2-V": 0.328,   # mean(0.5, 0.156) — Boundary V via LA=7
     "turbo4 / turbo4":   0.250,   # 4× compression
     "turbo3 / turbo3":   0.200,   # 5× compression
 }
@@ -211,6 +220,11 @@ DEFAULT_CONFIG = {
     "window_w": 1000,
     "window_h": 800,
     "sash_pos": None,
+    # Theme override. None = follow system (auto-detect via
+    # detect_system_dark_mode), True = force light, False = force dark.
+    # Toggled via the ☀/🌙 checkbox in the header. Takes effect on next
+    # launch (widget theming is frozen at __init__ time).
+    "light_mode": None,
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -839,6 +853,7 @@ NUT_KV_ORDER: tuple[str, ...] = (
     "q8_0 / q8_0",         # 0.500
     "q8_0-K + turbo4-V",   # 0.375
     "q8_0-K + turbo3-V",   # 0.350 — typischer Neutral-Kandidat
+    "q8_0-K + turbo2-V",   # 0.328 — Boundary V (benötigt LA=7)
     "turbo4 / turbo4",     # 0.250
     "turbo3 / turbo3",     # 0.200 — Context-Extrem
 )
@@ -1217,10 +1232,19 @@ class TurboQuantQLauncher(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"TurboQuant QLauncher v{APP_VERSION}")
-        self.is_dark = detect_system_dark_mode()
-        self.theme = DARK_THEME if self.is_dark else LIGHT_THEME
         self._first_run = not CONFIG_FILE.exists()
         self.cfg = load_config()
+        # Theme selection: explicit config override wins, else fall back
+        # to OS dark-mode detection. The ☀/🌙 checkbox in the header
+        # writes cfg["light_mode"] and prompts a restart (we don't do
+        # live re-theming because ~200 widgets reference self.theme
+        # directly and would all need rebuilding).
+        _light_override = self.cfg.get("light_mode")
+        if _light_override is None:
+            self.is_dark = detect_system_dark_mode()
+        else:
+            self.is_dark = not bool(_light_override)
+        self.theme = DARK_THEME if self.is_dark else LIGHT_THEME
         self.gpus: List[GPUInfo] = []
         self.models: List[ModelInfo] = []
         self.server_process: Optional[subprocess.Popen] = None
@@ -1348,6 +1372,40 @@ class TurboQuantQLauncher(tk.Tk):
         ttk.Label(row1, text=f"v{APP_VERSION}", font=FONT_SMALL,
                   foreground=t.fg_dim, style="H.TLabel").pack(side="left", padx=(8, 0))
 
+        # Theme toggle (right-aligned). Click the label to live-swap
+        # between dark and light. The label always shows the *current*
+        # mode — "🌙 Dark" while dark, "☀ Light" while light — so the
+        # user sees immediate visual feedback after clicking. Backed by
+        # self._light_var so the rest of _on_toggle_theme can read it
+        # without caring which widget triggered the change.
+        self._light_var = tk.BooleanVar(value=not self.is_dark)
+        theme_lbl = tk.Label(
+            row1,
+            text=("☀ Light" if not self.is_dark else "🌙 Dark"),
+            font=FONT_SMALL,
+            bg=t.bg_header, fg=t.fg_secondary,
+            cursor="hand2",
+            padx=6, pady=2,
+        )
+        theme_lbl.pack(side="right")
+        self._theme_lbl = theme_lbl
+
+        def _on_theme_label_click(_evt=None):
+            self._light_var.set(not self._light_var.get())
+            self._on_toggle_theme()
+
+        theme_lbl.bind("<Button-1>", _on_theme_label_click)
+        # Subtle hover feedback: brighten the foreground on enter,
+        # restore on leave. No background change so the header stays
+        # visually quiet.
+        theme_lbl.bind("<Enter>",
+                       lambda _e: theme_lbl.config(fg=t.fg))
+        theme_lbl.bind("<Leave>",
+                       lambda _e: theme_lbl.config(fg=t.fg_secondary))
+        ToolTip(theme_lbl,
+                "Click to switch between dark and light theme.",
+                t)
+
         # Use " " (space) instead of empty string as placeholder text.
         # tkinter gives a Label with text="" zero height — when the real
         # text arrives asynchronously (_do_initial_scan, GPU detection),
@@ -1361,6 +1419,226 @@ class TurboQuantQLauncher(tk.Tk):
                                       foreground=t.fg_dim, style="H.TLabel")
         self._cuda_label.pack(fill="x", padx=16, pady=(0, 6))
         ttk.Separator(self).pack(fill="x")
+
+    def _on_toggle_theme(self):
+        """Live-swap the active theme without restarting the launcher.
+
+        Tkinter has no built-in theme inheritance — every widget freezes
+        its colours at construction time, so a real swap means tearing
+        down and rebuilding the widget tree. We do exactly that:
+
+          1. Refuse the swap if a Probe / Bench All run is active
+             (those operations would race against the rebuild).
+          2. Persist all current UI state to cfg, plus the things that
+             only live in widgets (log content, sash position, model
+             selection).
+          3. Update self.theme / self.is_dark.
+          4. Destroy every child of the Tk root.
+          5. Re-run the build sequence from __init__ in the same order.
+          6. Repopulate everything from cached state on self (gpus,
+             models, log lines, qnut profile, running indicator) so the
+             user sees the new theme without losing any context.
+        """
+        want_light = self._light_var.get()
+        target_dark = not want_light
+
+        # No-op if the desired state already matches.
+        if target_dark == self.is_dark:
+            return
+
+        # Refuse mid-operation. Probe and Bench All write to UI widgets
+        # from background threads via self.after; tearing down those
+        # widgets while they're still being touched would crash.
+        if self._probe_in_progress:
+            messagebox.showwarning(
+                "Theme switch unavailable",
+                "A Probe run is currently in progress. Please wait for "
+                "it to finish before switching theme.",
+            )
+            self._light_var.set(not want_light)  # revert checkbox
+            return
+        if self._bench_thread is not None and self._bench_thread.is_alive():
+            messagebox.showwarning(
+                "Theme switch unavailable",
+                "A Bench All run is currently in progress. Please wait "
+                "for it to finish before switching theme.",
+            )
+            self._light_var.set(not want_light)  # revert checkbox
+            return
+
+        # ── Step 1: persist everything we will need to restore ────────
+        self.cfg["light_mode"] = want_light
+        try:
+            self._save_current_config()
+        except Exception:
+            pass
+
+        # Capture the log Text contents (raw, with embedded timestamps).
+        # We lose the per-line tag colours but the timestamps and text
+        # itself are preserved verbatim.
+        saved_log_dump = ""
+        try:
+            saved_log_dump = self._log_text.get("1.0", "end-1c")
+        except Exception:
+            pass
+
+        # Capture the vertical sash position so the model/log split
+        # stays where the user put it.
+        saved_sash = None
+        try:
+            _, saved_sash = self._paned.sash_coord(0)
+        except Exception:
+            pass
+
+        # Capture the active model selection so the same model stays
+        # highlighted after the rebuild (otherwise _rebuild_model_cards
+        # resets _sel_model to -1).
+        saved_sel_model = self._sel_model
+        saved_sel_row = self._sel_row
+
+        # ── Step 2: swap the theme ────────────────────────────────────
+        self.is_dark = target_dark
+        self.theme = DARK_THEME if self.is_dark else LIGHT_THEME
+
+        # ── Step 3: nuke the widget tree ──────────────────────────────
+        for child in list(self.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+
+        # ── Step 4: re-run the build sequence (mirror __init__) ───────
+        self._configure_theme()
+        self._build_header()
+        self._build_settings_bar()
+        self._build_footer()
+        self._paned = tk.PanedWindow(self, orient=tk.VERTICAL,
+                                      bg=self.theme.border,
+                                      sashwidth=5, sashrelief="flat",
+                                      handlesize=0, showhandle=False)
+        self._paned.pack(fill="both", expand=True, padx=16, pady=(4, 4))
+        self._build_model_list()
+        self._build_log_area()
+
+        # ── Step 5: repopulate from cached state ──────────────────────
+
+        # Header GPU label — uses cached self.gpus from the original
+        # _do_initial_scan. No re-detection needed.
+        try:
+            if self.gpus:
+                parts = []
+                for g in self.gpus:
+                    vram = f" ({g.vram_mb // 1024} GB)" if g.vram_mb else ""
+                    parts.append(f"GPU {g.index}: {g.name}{vram}")
+                if self._cpu_ram_gb > 0:
+                    parts.append(f"CPU RAM: {self._cpu_ram_gb:.0f} GB")
+                self._gpu_label.config(text="  •  ".join(parts))
+            elif self._cpu_ram_gb > 0:
+                self._gpu_label.config(
+                    text=f"No GPUs detected — CPU mode only — "
+                         f"CPU RAM: {self._cpu_ram_gb:.0f} GB")
+        except Exception:
+            pass
+
+        # Header CUDA label — quick re-detect (no GPU rescan).
+        try:
+            cuda_ver = detect_cuda_version()
+            server_path = self.cfg.get("llama_server_path", "")
+            server_dir = os.path.dirname(server_path)
+            dll_results = check_required_dlls(server_dir) if server_dir else []
+            dll_found = sum(1 for d in dll_results if d["found"])
+            dll_total = len(dll_results)
+            cuda_parts = []
+            if cuda_ver:
+                cuda_parts.append(f"CUDA {cuda_ver} (driver)")
+            sp_lower = server_path.lower()
+            if "cuda128" in sp_lower:
+                cuda_parts.append("Build: CUDA 12.8")
+            elif "cuda132" in sp_lower:
+                cuda_parts.append("Build: CUDA 13.2")
+            elif server_dir:
+                cuda_parts.append(f"Build: {os.path.basename(server_dir)}")
+            if dll_total > 0:
+                if dll_found == dll_total:
+                    cuda_parts.append(f"DLLs: {dll_found}/{dll_total} ✓")
+                    dll_color = self.theme.fg_secondary
+                else:
+                    cuda_parts.append(f"DLLs: {dll_found}/{dll_total} ✗")
+                    dll_color = self.theme.yellow
+            else:
+                dll_color = self.theme.fg_dim
+                cuda_parts.append("DLLs: server path not set")
+            self._cuda_label.config(
+                text="  •  ".join(cuda_parts), foreground=dll_color)
+        except Exception:
+            pass
+
+        # GPU buttons (uses cached self.gpus).
+        try:
+            self._build_gpu_buttons()
+        except Exception:
+            pass
+
+        # Model cards (uses cached self.models).
+        try:
+            if self.models:
+                self._models_header.config(
+                    text=f"Models ({len(self.models)} GGUF, "
+                         f"{sum(m.size_gb for m in self.models):.0f} GB)")
+            self._rebuild_model_cards()
+        except Exception:
+            pass
+
+        # Quick-switch slot buttons.
+        try:
+            self._refresh_slot_buttons()
+        except Exception:
+            pass
+
+        # Log content — re-insert the saved dump as a single block.
+        # We use the "info" tag for everything because per-line tag
+        # preservation would require dump/parse cycles that aren't
+        # worth the visual fidelity gain.
+        if saved_log_dump:
+            try:
+                self._log_text.config(state="normal")
+                self._log_text.delete("1.0", "end")
+                self._log_text.insert("end", saved_log_dump + "\n", "info")
+                self._log_text.see("end")
+                self._log_text.config(state="disabled")
+            except Exception:
+                pass
+
+        # Restore sash position (after a short delay so the paned
+        # window has time to compute its full size).
+        if saved_sash is not None:
+            self.cfg["sash_pos"] = saved_sash
+            self.after(50, self._restore_sash)
+
+        # Restore model selection. _select_cell handles re-selecting
+        # the row, refreshing the KV/LA visuals, and triggering the
+        # qnut profile load for the active (model, server_slot).
+        if (saved_sel_model >= 0
+                and saved_sel_model < len(self.models)):
+            try:
+                self.after(60, lambda: self._select_cell(
+                    saved_sel_model, saved_sel_row))
+            except Exception:
+                pass
+
+        # Refresh the running indicator if a server is still running
+        # in the background — _update_running_indicator walks the
+        # rebuilt model cards and re-applies the highlight.
+        if self.running_model:
+            try:
+                self.after(70, self._update_running_indicator)
+            except Exception:
+                pass
+
+        self._log(
+            f"Theme switched to {'Light' if want_light else 'Dark'} mode.",
+            "info",
+        )
 
     # ─── Settings Bar ─────────────────────────────────────────────────────
 
@@ -1397,6 +1675,9 @@ class TurboQuantQLauncher(tk.Tk):
             "turbo3 / turbo3":   ("t3/t3",    "Symmetric turbo3 — 5x compression, max context"),
             "turbo4 / turbo4":   ("t4/t4",    "Symmetric turbo4 — 4x compression"),
             "q8_0-K + turbo3-V": ("q8₀+t3",   "Keys at q8_0, Values at turbo3 — high compression"),
+            "q8_0-K + turbo2-V": ("q8₀+t2",   "Keys at q8_0, Values at turbo2 — Boundary V "
+                                              "(requires LA=7 for first/last 2 layers at q8_0-V, "
+                                              "otherwise catastrophic PPL). TheTom 08.04.2026."),
             "q8_0 / q8_0":       ("q8₀/q8₀",  "Symmetric 8-bit quantization, 2x compression"),
         }
         for full_name, (short, tip) in kv_config.items():
