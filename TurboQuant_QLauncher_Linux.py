@@ -4220,8 +4220,20 @@ class TurboQuantQLauncher(tk.Tk):
 
     # ─── 2D Cell Selection ────────────────────────────────────────────────
 
-    def _select_cell(self, model_idx: int, row_idx: int):
-        """Select a specific GPU row within a model card."""
+    def _select_cell(self, model_idx: int, row_idx: int, scroll: str = "none"):
+        """Select a specific GPU row within a model card.
+
+        scroll:
+          "none"  - never move the canvas view. Used for mouse clicks
+                    and initial auto-selection — the user scrolls
+                    manually with the mouse wheel when they want to see
+                    something off-screen.
+          "into"  - only scroll if the selection ended up off-screen,
+                    and then only the minimum amount to bring it back
+                    into view. Used for keyboard Up/Down/Left/Right so
+                    the selection stays visible as you walk through
+                    rows past the viewport edges.
+        """
         t = self.theme
         if model_idx < 0 or model_idx >= len(self.models):
             return
@@ -4243,29 +4255,38 @@ class TurboQuantQLauncher(tk.Tk):
         rd = card_data["gpu_rows"][row_idx]
         rd["frame"].config(highlightbackground=t.accent)
 
-        # Force a full geometry update of the entire scrollable area —
-        # not just rd["frame"]. This is required for two reasons:
-        #   1. _inner_frame.winfo_height() returns 1 if the geometry
-        #      manager hasn't laid out the inner frame yet, which is
-        #      always the case on the very first auto-selection right
-        #      after _populate_models() builds the cards. Without this
-        #      update we compute frame_y / canvas_h / inner_h against
-        #      stale geometry and yview_moveto leaves a visible empty
-        #      band above the first card.
-        #   2. The canvas scrollregion is set lazily via the <Configure>
-        #      binding on _inner_frame, which fires on the next event-
-        #      loop iteration — too late for an inline yview_moveto
-        #      that runs in the same call. Setting the scrollregion
-        #      explicitly here makes the scroll math consistent.
-        self._inner_frame.update_idletasks()
-        bbox = self._canvas.bbox("all")
-        if bbox:
-            self._canvas.configure(scrollregion=bbox)
+        if scroll == "into":
+            # Ensure geometry is up-to-date — winfo_height() returns 1
+            # on freshly built widgets until the idle loop runs.
+            self._inner_frame.update_idletasks()
+            bbox = self._canvas.bbox("all")
+            if bbox:
+                self._canvas.configure(scrollregion=bbox)
 
-        frame_y = rd["frame"].winfo_y() + card_data["card"].winfo_y()
-        canvas_h = self._canvas.winfo_height()
-        inner_h = max(1, self._inner_frame.winfo_height())
-        self._canvas.yview_moveto(max(0, (frame_y - canvas_h // 3)) / inner_h)
+            frame_y = rd["frame"].winfo_y() + card_data["card"].winfo_y()
+            frame_h = rd["frame"].winfo_height()
+            canvas_h = self._canvas.winfo_height()
+            inner_h = max(1, self._inner_frame.winfo_height())
+
+            # Current visible window in scrollregion-pixel coordinates.
+            yview_top, yview_bot = self._canvas.yview()
+            view_top_px = yview_top * inner_h
+            view_bot_px = yview_bot * inner_h
+
+            sel_top = frame_y
+            sel_bot = frame_y + frame_h
+            margin = 6
+
+            # Minimum-motion scrolling: only move if off-screen, and
+            # only far enough to expose the selected row with a small
+            # margin. Never center, never third-of-viewport.
+            if sel_top < view_top_px:
+                new_top = max(0, sel_top - margin)
+                self._canvas.yview_moveto(new_top / inner_h)
+            elif sel_bot > view_bot_px:
+                new_top = min(inner_h - canvas_h, sel_bot + margin - canvas_h)
+                self._canvas.yview_moveto(new_top / inner_h)
+            # else: already fully visible — leave the view untouched.
 
         # qnut (v0.48): refresh KV button visuals from this model's
         # cached nut data. If no data exists, the buttons fall back to
@@ -4293,25 +4314,58 @@ class TurboQuantQLauncher(tk.Tk):
         self._on_run_model(fn, gpu_key)
 
     # ─── Keyboard Navigation ─────────────────────────────────────────────
+    # Up/Down navigate linearly through ALL rows of the flat list:
+    # RTX5090 → RTX4090 → CPU RAM → (next model) RTX5090 → ...
+    # Without this, pressing Down from row 0 of model A would jump to
+    # row 0 of model B, skipping the CPU RAM row entirely.
+    # Left/Right still move only within the current model (useful when
+    # you want to pick a different GPU without leaving the current model).
+    # Keyboard nav is the ONLY path that passes scroll="into" — mouse
+    # clicks never move the view.
 
     def _on_key_up(self, event):
-        if self._sel_model > 0:
-            self._select_cell(self._sel_model - 1, self._sel_row)
+        """Move one row up. At the top row of a model, jump to the last
+        row of the previous model."""
+        m, r = self._sel_model, self._sel_row
+        if m < 0:
+            return
+        if r > 0:
+            self._select_cell(m, r - 1, scroll="into")
+        elif m > 0:
+            prev_fn = self.models[m - 1].filename
+            prev_card = self._model_cards.get(prev_fn)
+            if prev_card:
+                last_row = len(prev_card["gpu_rows"]) - 1
+                self._select_cell(m - 1, last_row, scroll="into")
 
     def _on_key_down(self, event):
-        if self._sel_model < len(self.models) - 1:
-            self._select_cell(self._sel_model + 1, self._sel_row)
+        """Move one row down. At the bottom row of a model, jump to
+        row 0 of the next model."""
+        m, r = self._sel_model, self._sel_row
+        if m < 0:
+            return
+        fn = self.models[m].filename
+        card = self._model_cards.get(fn)
+        if not card:
+            return
+        max_row = len(card["gpu_rows"]) - 1
+        if r < max_row:
+            self._select_cell(m, r + 1, scroll="into")
+        elif m < len(self.models) - 1:
+            self._select_cell(m + 1, 0, scroll="into")
 
     def _on_key_left(self, event):
+        """Move one row up within the current model (no crossing)."""
         if self._sel_row > 0:
-            self._select_cell(self._sel_model, self._sel_row - 1)
+            self._select_cell(self._sel_model, self._sel_row - 1, scroll="into")
 
     def _on_key_right(self, event):
+        """Move one row down within the current model (no crossing)."""
         fn = self.models[self._sel_model].filename if self._sel_model >= 0 else None
         card_data = self._model_cards.get(fn) if fn else None
         max_row = len(card_data["gpu_rows"]) - 1 if card_data else 0
         if self._sel_row < max_row:
-            self._select_cell(self._sel_model, self._sel_row + 1)
+            self._select_cell(self._sel_model, self._sel_row + 1, scroll="into")
 
     def _on_key_enter(self, event):
         if self._sel_model < 0:

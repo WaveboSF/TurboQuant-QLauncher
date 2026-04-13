@@ -48,7 +48,7 @@ from tkinter import ttk, messagebox, filedialog
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.51"
+APP_VERSION = "0.52"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -734,14 +734,69 @@ class ModelInfo:
     # 2026-04-07: TheTom v2 + Qwen 27B from "Q:\AI, Deeplearning, ...".
     has_unsafe_path: bool = False
 
+# Directory name patterns to skip during recursive scanning. These are
+# places where .gguf files may exist but are NOT user-selectable LLMs:
+# Ollama's blob store (opaque hash filenames), conda/pip caches,
+# virtualenvs, build caches, hidden config dirs, Windows system dirs.
+# Match is case-insensitive on the basename of the directory.
+_SCAN_EXCLUDE_DIRS = frozenset({
+    # Python / package manager / env dirs (cross-platform)
+    ".cache", ".conda", "conda-meta", ".venv", "venv", "venvs",
+    "miniconda3", "anaconda3", "__pycache__", "site-packages",
+    "pip-cache", ".npm", "node_modules",
+    # Ollama blob store (hash filenames, useless in UI)
+    ".ollama", "ollama",
+    # Windows-specific junk
+    "appdata", "$recycle.bin", "system volume information",
+    "programdata", "windows",
+    # Browser / IDE / misc caches
+    "mozilla", ".mozilla", ".config", ".wine",
+    # Compile caches produced by unsloth etc.
+    "unsloth_compiled_cache",
+    # Build dirs
+    "build", "dist",
+    # System trash
+    ".trash",
+})
+
+# Minimum GGUF file size to be considered a "real" model. Anything
+# smaller is overwhelmingly vocab-only files (ggml-vocab-*.gguf are
+# typically <5 MB), stub test fixtures, or corrupted downloads. Real
+# quantized LLMs start around 500 MB even for tiny 1-2B models. We
+# pick 50 MB as a conservative lower bound.
+_MIN_MODEL_SIZE_BYTES = 50 * 1024 * 1024
+
+# Filename substrings that mark a GGUF as NOT a user-selectable model
+# regardless of size. These are files llama.cpp and some model
+# distributions ship for internal testing / tokenizer shipping.
+_FILENAME_JUNK_HINTS = (
+    "ggml-vocab-",   # vocabulary-only dumps from llama.cpp tests
+    "-vocab.gguf",   # same pattern, alt naming
+    ".tmp.gguf",     # partial downloads
+)
+
+def _is_junk_filename(fn: str) -> bool:
+    low = fn.lower()
+    return any(h in low for h in _FILENAME_JUNK_HINTS)
+
 def scan_models(models_dirs, recursive: bool = True) -> List[ModelInfo]:
     """Scan one or more directories for *.gguf files.
 
     Accepts either a single path (str) or a list of paths. When
     ``recursive`` is True (default), descends into subdirectories via
     ``os.walk``; otherwise only the top level of each directory is scanned.
-    Results are deduplicated by canonical (realpath) location, so overlapping
-    directories or symlinks won't list the same file twice.
+
+    Applies three filters so pointing the launcher at a broad directory
+    (e.g. C:\\Users\\wavebo) still yields a clean list of actual LLMs:
+      1. Skip common junk directories (venvs, .ollama blob store,
+         AppData, conda envs, __pycache__, unsloth caches, etc.)
+      2. Skip hidden directories (starting with "."), except the root
+         of a user-provided path (which may legitimately be hidden).
+      3. Skip files smaller than _MIN_MODEL_SIZE_BYTES (50 MB) and
+         files matching _FILENAME_JUNK_HINTS (ggml-vocab-*, etc.).
+
+    Results are deduplicated by canonical (realpath) location so
+    overlapping directories or symlinks won't list the same file twice.
     """
     # Normalize input to a list of non-empty strings
     if isinstance(models_dirs, str):
@@ -754,35 +809,59 @@ def scan_models(models_dirs, recursive: bool = True) -> List[ModelInfo]:
         if not os.path.isdir(models_dir):
             continue
         if recursive:
-            walker = os.walk(models_dir)
+            # Filter subdirs in-place so os.walk doesn't descend into them.
+            for root, subdirs, files in os.walk(models_dir, topdown=True):
+                pruned = []
+                for d in subdirs:
+                    low = d.lower()
+                    if low in _SCAN_EXCLUDE_DIRS:
+                        continue
+                    if d.startswith(".") and d not in (".",):
+                        continue
+                    pruned.append(d)
+                subdirs[:] = pruned
+                for f in files:
+                    _maybe_add_model(seen, root, f)
         else:
             try:
                 entries = os.listdir(models_dir)
             except OSError:
                 continue
-            walker = [(models_dir, [], entries)]
-        for root, _dirs, files in walker:
-            for f in files:
-                if not f.lower().endswith(".gguf"):
-                    continue
-                full_path = os.path.join(root, f)
-                try:
-                    key = os.path.realpath(full_path)
-                    if key in seen:
-                        continue
-                    size = os.path.getsize(full_path)
-                    seen[key] = ModelInfo(
-                        filename=f,
-                        path=full_path,
-                        size_bytes=size,
-                        size_gb=round(size / (1024**3), 1),
-                        has_unsafe_path=("," in full_path),
-                    )
-                except OSError:
-                    pass
+            for f in entries:
+                full = os.path.join(models_dir, f)
+                if os.path.isfile(full):
+                    _maybe_add_model(seen, models_dir, f)
+
     models = list(seen.values())
     models.sort(key=lambda m: m.size_bytes, reverse=True)
     return models
+
+def _maybe_add_model(seen: Dict[str, "ModelInfo"], root: str, filename: str) -> None:
+    """Helper for scan_models — size/filename filter + dedup insertion."""
+    if not filename.lower().endswith(".gguf"):
+        return
+    if _is_junk_filename(filename):
+        return
+    full_path = os.path.join(root, filename)
+    try:
+        size = os.path.getsize(full_path)
+    except OSError:
+        return
+    if size < _MIN_MODEL_SIZE_BYTES:
+        return
+    try:
+        key = os.path.realpath(full_path)
+    except OSError:
+        key = full_path
+    if key in seen:
+        return
+    seen[key] = ModelInfo(
+        filename=filename,
+        path=full_path,
+        size_bytes=size,
+        size_gb=round(size / (1024**3), 1),
+        has_unsafe_path=("," in full_path),
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION: Config Management
@@ -3324,8 +3403,25 @@ class TurboQuantQLauncher(tk.Tk):
         self._inner_frame.bind("<Configure>",
                                lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
         self._canvas.bind("<Configure>", self._on_canvas_resize)
-        self._canvas.bind_all("<MouseWheel>",
-                              lambda e: self._canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+        # Scope-checked mousewheel. bind_all catches the event globally,
+        # but we only scroll the model list when the cursor is actually
+        # inside our canvas hierarchy. Without this check, scrolling
+        # anywhere in the window (e.g. over the log Text widget) would
+        # also move the model list — confusing and wrong.
+        def _on_mousewheel(event):
+            w = event.widget
+            # Walk up from the widget under the cursor. If we reach our
+            # canvas, the cursor is over the model list → scroll it.
+            # Otherwise let the event fall through to the default handler.
+            while w is not None:
+                if w is self._canvas:
+                    self._canvas.yview_scroll(-1 * (event.delta // 120), "units")
+                    return
+                try:
+                    w = w.master
+                except AttributeError:
+                    break
+        self._canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
     def _on_canvas_resize(self, event):
         self._canvas.itemconfig(self._canvas_window, width=event.width)
@@ -3658,8 +3754,20 @@ class TurboQuantQLauncher(tk.Tk):
 
     # ─── 2D Cell Selection ────────────────────────────────────────────────
 
-    def _select_cell(self, model_idx: int, row_idx: int):
-        """Select a specific GPU row within a model card."""
+    def _select_cell(self, model_idx: int, row_idx: int, scroll: str = "none"):
+        """Select a specific GPU row within a model card.
+
+        scroll:
+          "none"  - never move the canvas view. Used for mouse clicks
+                    and initial auto-selection — the user scrolls
+                    manually with the mouse wheel when they want to see
+                    something off-screen.
+          "into"  - only scroll if the selection ended up off-screen,
+                    and then only the minimum amount to bring it back
+                    into view. Used for keyboard Up/Down/Left/Right so
+                    the selection stays visible as you walk through
+                    rows past the viewport edges.
+        """
         t = self.theme
         if model_idx < 0 or model_idx >= len(self.models):
             return
@@ -3681,29 +3789,38 @@ class TurboQuantQLauncher(tk.Tk):
         rd = card_data["gpu_rows"][row_idx]
         rd["frame"].config(highlightbackground=t.accent)
 
-        # Force a full geometry update of the entire scrollable area —
-        # not just rd["frame"]. This is required for two reasons:
-        #   1. _inner_frame.winfo_height() returns 1 if the geometry
-        #      manager hasn't laid out the inner frame yet, which is
-        #      always the case on the very first auto-selection right
-        #      after _populate_models() builds the cards. Without this
-        #      update we compute frame_y / canvas_h / inner_h against
-        #      stale geometry and yview_moveto leaves a visible empty
-        #      band above the first card.
-        #   2. The canvas scrollregion is set lazily via the <Configure>
-        #      binding on _inner_frame, which fires on the next event-
-        #      loop iteration — too late for an inline yview_moveto
-        #      that runs in the same call. Setting the scrollregion
-        #      explicitly here makes the scroll math consistent.
-        self._inner_frame.update_idletasks()
-        bbox = self._canvas.bbox("all")
-        if bbox:
-            self._canvas.configure(scrollregion=bbox)
+        if scroll == "into":
+            # Ensure geometry is up-to-date — winfo_height() returns 1
+            # on freshly built widgets until the idle loop runs.
+            self._inner_frame.update_idletasks()
+            bbox = self._canvas.bbox("all")
+            if bbox:
+                self._canvas.configure(scrollregion=bbox)
 
-        frame_y = rd["frame"].winfo_y() + card_data["card"].winfo_y()
-        canvas_h = self._canvas.winfo_height()
-        inner_h = max(1, self._inner_frame.winfo_height())
-        self._canvas.yview_moveto(max(0, (frame_y - canvas_h // 3)) / inner_h)
+            frame_y = rd["frame"].winfo_y() + card_data["card"].winfo_y()
+            frame_h = rd["frame"].winfo_height()
+            canvas_h = self._canvas.winfo_height()
+            inner_h = max(1, self._inner_frame.winfo_height())
+
+            # Current visible window in scrollregion-pixel coordinates.
+            yview_top, yview_bot = self._canvas.yview()
+            view_top_px = yview_top * inner_h
+            view_bot_px = yview_bot * inner_h
+
+            sel_top = frame_y
+            sel_bot = frame_y + frame_h
+            margin = 6
+
+            # Minimum-motion scrolling: only move if off-screen, and
+            # only far enough to expose the selected row with a small
+            # margin. Never center, never third-of-viewport.
+            if sel_top < view_top_px:
+                new_top = max(0, sel_top - margin)
+                self._canvas.yview_moveto(new_top / inner_h)
+            elif sel_bot > view_bot_px:
+                new_top = min(inner_h - canvas_h, sel_bot + margin - canvas_h)
+                self._canvas.yview_moveto(new_top / inner_h)
+            # else: already fully visible — leave the view untouched.
 
         # qnut (v0.48): refresh KV button visuals from this model's
         # cached nut data. If no data exists, the buttons fall back to
@@ -3731,25 +3848,58 @@ class TurboQuantQLauncher(tk.Tk):
         self._on_run_model(fn, gpu_key)
 
     # ─── Keyboard Navigation ─────────────────────────────────────────────
+    # Up/Down navigate linearly through ALL rows of the flat list:
+    # RTX5090 → RTX4090 → CPU RAM → (next model) RTX5090 → ...
+    # Without this, pressing Down from row 0 of model A would jump to
+    # row 0 of model B, skipping the CPU RAM row entirely.
+    # Left/Right still move only within the current model (useful when
+    # you want to pick a different GPU without leaving the current model).
+    # Keyboard nav is the ONLY path that passes scroll="into" — mouse
+    # clicks never move the view.
 
     def _on_key_up(self, event):
-        if self._sel_model > 0:
-            self._select_cell(self._sel_model - 1, self._sel_row)
+        """Move one row up. At the top row of a model, jump to the last
+        row of the previous model."""
+        m, r = self._sel_model, self._sel_row
+        if m < 0:
+            return
+        if r > 0:
+            self._select_cell(m, r - 1, scroll="into")
+        elif m > 0:
+            prev_fn = self.models[m - 1].filename
+            prev_card = self._model_cards.get(prev_fn)
+            if prev_card:
+                last_row = len(prev_card["gpu_rows"]) - 1
+                self._select_cell(m - 1, last_row, scroll="into")
 
     def _on_key_down(self, event):
-        if self._sel_model < len(self.models) - 1:
-            self._select_cell(self._sel_model + 1, self._sel_row)
+        """Move one row down. At the bottom row of a model, jump to
+        row 0 of the next model."""
+        m, r = self._sel_model, self._sel_row
+        if m < 0:
+            return
+        fn = self.models[m].filename
+        card = self._model_cards.get(fn)
+        if not card:
+            return
+        max_row = len(card["gpu_rows"]) - 1
+        if r < max_row:
+            self._select_cell(m, r + 1, scroll="into")
+        elif m < len(self.models) - 1:
+            self._select_cell(m + 1, 0, scroll="into")
 
     def _on_key_left(self, event):
+        """Move one row up within the current model (no crossing)."""
         if self._sel_row > 0:
-            self._select_cell(self._sel_model, self._sel_row - 1)
+            self._select_cell(self._sel_model, self._sel_row - 1, scroll="into")
 
     def _on_key_right(self, event):
+        """Move one row down within the current model (no crossing)."""
         fn = self.models[self._sel_model].filename if self._sel_model >= 0 else None
         card_data = self._model_cards.get(fn) if fn else None
         max_row = len(card_data["gpu_rows"]) - 1 if card_data else 0
         if self._sel_row < max_row:
-            self._select_cell(self._sel_model, self._sel_row + 1)
+            self._select_cell(self._sel_model, self._sel_row + 1, scroll="into")
 
     def _on_key_enter(self, event):
         if self._sel_model < 0:
