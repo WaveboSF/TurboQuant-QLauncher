@@ -70,7 +70,7 @@ def no_console_kwargs() -> dict:
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.52"
+APP_VERSION = "0.53"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -779,15 +779,70 @@ def detect_all_gpus() -> List[GPUInfo]:
                 nl = line.lower()
                 if any(g.vendor == "nvidia" for g in gpus) and "nvidia" in nl:
                     continue
+                raw = line.split(":", 2)[-1].strip()
+                cleaned = _clean_lspci_gpu_name(raw)
                 if "radeon" in nl or "amd" in nl:
-                    gpus.append(GPUInfo(index=idx, name=line.split(":")[-1].strip(),
-                                        vendor="amd"))
+                    gpus.append(GPUInfo(index=idx, name=cleaned, vendor="amd"))
                     idx += 1
                 elif "intel" in nl:
-                    gpus.append(GPUInfo(index=idx, name=line.split(":")[-1].strip(),
-                                        vendor="intel"))
+                    gpus.append(GPUInfo(index=idx, name=cleaned, vendor="intel"))
                     idx += 1
     return gpus
+
+def _clean_lspci_gpu_name(raw: str) -> str:
+    """Turn lspci's verbose GPU name into something short and readable.
+
+    lspci raw output examples:
+      "Advanced Micro Devices, Inc. [AMD/ATI] Raphael (rev c2)"
+        -> "Radeon (Raphael)"
+      "Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]"
+        -> "Radeon RX 7900 XTX"
+      "Intel Corporation Raptor Lake-S UHD Graphics (rev 04)"
+        -> "Intel UHD Graphics (Raptor Lake-S)"
+      "NVIDIA Corporation GA102 [GeForce RTX 3090]"
+        -> "GeForce RTX 3090"
+    """
+    import re
+    s = raw
+    # Drop "(rev XX)" suffix
+    s = re.sub(r"\s*\(rev [^)]+\)\s*$", "", s)
+    # Prefer the bracketed product name if present: "... [Radeon RX 7900 XTX]"
+    bracketed = re.findall(r"\[([^\]]+)\]", s)
+    for b in bracketed:
+        bl = b.lower()
+        # Skip generic vendor brackets like "[AMD/ATI]"
+        if bl in ("amd/ati", "amd", "ati"):
+            continue
+        if any(k in bl for k in ("radeon", "geforce", "quadro", "rtx", "gtx",
+                                  "arc", "iris", "uhd graphics", "hd graphics")):
+            return b.strip()
+    # Strip known vendor prefix noise
+    s = re.sub(r"^Advanced Micro Devices,?\s*Inc\.?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\[AMD/ATI\]\s*", "", s)
+    s = re.sub(r"^NVIDIA Corporation\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^Intel Corporation\s*", "", s, flags=re.IGNORECASE)
+    # Remove any remaining "[AMD/ATI]" marker mid-string
+    s = re.sub(r"\s*\[AMD/ATI\]\s*", " ", s)
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    # If the codename survived alone (e.g. "Raphael", "Renoir", "Cezanne"),
+    # tag it as a Radeon iGPU so the user sees what it is.
+    low = s.lower()
+    AMD_IGPU_CODENAMES = ("raphael", "renoir", "cezanne", "rembrandt",
+                          "phoenix", "hawk point", "strix", "granite ridge",
+                          "lucienne", "barcelo", "mendocino", "picasso",
+                          "van gogh")
+    if any(cn in low for cn in AMD_IGPU_CODENAMES):
+        return f"Radeon iGPU ({s})"
+    INTEL_IGPU_CODENAMES = ("raptor lake", "alder lake", "tiger lake",
+                             "rocket lake", "comet lake", "meteor lake",
+                             "arrow lake", "lunar lake")
+    if any(cn in low for cn in INTEL_IGPU_CODENAMES):
+        return f"Intel iGPU ({s})"
+    # Fall back to whatever's left, capped at 28 chars (our row label width)
+    if len(s) > 28:
+        s = s[:26] + "…"
+    return s or raw[:28]
 
 def detect_cpu_ram_gb() -> float:
     """Detect total system RAM in GB."""
@@ -3928,7 +3983,13 @@ class TurboQuantQLauncher(tk.Tk):
         bar.pack(side="bottom", fill="x", padx=16, pady=(6, 8))
         tk.Frame(self, height=1, bg=t.border).pack(side="bottom", fill="x")
 
-        _BTN_W, _BTN_H = 130, 28
+        # Footer button width: Linux's default mono fonts (DejaVu Sans
+        # Mono etc.) are wider than Windows' Consolas at the same point
+        # size, so "Update Binaries" overflows 130 px. Give a little
+        # more room on non-Windows. HiDPI scaling multiplies this
+        # downstream, so the absolute value can stay modest.
+        _BTN_W = 130 if IS_WINDOWS else 160
+        _BTN_H = 28
         HoverButton(bar, t, text="Rescan Models", color=ACCENT_SOFT,
                     width=_BTN_W, height=_BTN_H,
                     command=self._rescan_models).pack(side="left", padx=2)
@@ -3944,15 +4005,19 @@ class TurboQuantQLauncher(tk.Tk):
         self._slot_bar.pack(side="left", padx=(10, 0))
         self._slot_buttons: list = []  # filled by _refresh_slot_buttons
 
+        # Right-aligned buttons: also wider on Linux for the same
+        # font-metrics reason as Rescan/Update above.
+        _SIDE_W = 80 if IS_WINDOWS else 100
+        _SAVE_W = 168 if IS_WINDOWS else 200
         HoverButton(bar, t, text="About", color=ACCENT_SOFT,
-                    width=80, height=_BTN_H,
+                    width=_SIDE_W, height=_BTN_H,
                     command=self._show_about).pack(side="right", padx=2)
         HoverButton(bar, t, text="Paths", color=ACCENT_SOFT,
-                    width=80, height=_BTN_H,
+                    width=_SIDE_W, height=_BTN_H,
                     command=self._show_paths_dialog).pack(side="right", padx=2)
 
         self._save_bench_btn = HoverButton(bar, t, text="💾  Save Results...",
-                                            color=t.border, width=168, height=_BTN_H,
+                                            color=t.border, width=_SAVE_W, height=_BTN_H,
                                             command=self._save_pending_bench)
         self._save_bench_btn.configure_btn(state="disabled")
         self._save_bench_btn.pack(side="right", padx=(2, 12))
