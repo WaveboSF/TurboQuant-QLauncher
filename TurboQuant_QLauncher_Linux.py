@@ -70,7 +70,7 @@ def no_console_kwargs() -> dict:
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.51"
+APP_VERSION = "0.52"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -188,23 +188,47 @@ MAX_SERVER_SLOTS = 6  # up to 6 quick-switch bookmark slots for llama-server.exe
 MAX_MODELS_PATHS = 3  # up to 3 LLM model directories scanned together
 
 def slot_label_from_path(server_exe_path: str) -> str:
-    """Derive a short button label from a llama-server.exe path.
+    """Derive a short button label from a llama-server(.exe) path.
 
     Strip the common 'llama-server_' prefix from the parent folder name
     so buttons stay compact. Examples:
       G:\\...\\llama-server_thetom_cuda132\\llama-server.exe → 'thetom_cuda132'
       G:\\...\\llama-server_gemma4_cuda132\\llama-server.exe → 'gemma4_cuda132'
       G:\\...\\my_custom_build\\llama-server.exe            → 'my_custom_build'
+
+    Linux-specific heuristic: if the immediate parent folder is a
+    generic build-output name (bin, build, Release, Debug, out), walk
+    one level up so the label actually identifies the fork, e.g.:
+      /home/wavebo/llama-cpp-turboquant/build/bin/llama-server
+        → 'llama-cpp-turboquant'   (not 'bin')
+      /home/wavebo/llama-cpp-madreag/build/bin/llama-server
+        → 'llama-cpp-madreag'      (not 'bin')
+
     Returns empty string for empty/invalid input.
     """
     if not server_exe_path:
         return ""
     try:
-        folder = os.path.basename(os.path.dirname(server_exe_path))
+        parent = os.path.dirname(server_exe_path)
+        folder = os.path.basename(parent)
     except Exception:
         return ""
     if not folder:
         return ""
+    # Linux heuristic: walk up past generic build-output folder names.
+    _GENERIC = {"bin", "build", "release", "debug", "out", "dist"}
+    if folder.lower() in _GENERIC:
+        try:
+            up = os.path.dirname(parent)
+            up_name = os.path.basename(up)
+            # Walk up at most twice: bin -> build -> <project>.
+            if up_name.lower() in _GENERIC:
+                up = os.path.dirname(up)
+                up_name = os.path.basename(up)
+            if up_name:
+                folder = up_name
+        except Exception:
+            pass
     # Strip the "llama-server_" prefix if present (common pattern in Silvestar's setup)
     low = folder.lower()
     if low.startswith("llama-server_"):
@@ -331,7 +355,70 @@ LIGHT_THEME = ThemeColors(
 # SECTION: Font Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_MONO = "Consolas" if sys.platform == "win32" else "DejaVu Sans Mono"
+def _pick_mono_font(probe_root=None) -> str:
+    """Pick the best available monospace font for the current platform.
+
+    Windows: Consolas is always present and rendered crisply.
+    macOS: Menlo is the system default monospace.
+    Linux: probe a preference list in order — modern programming fonts
+    first (JetBrains Mono, Fira Code, Cascadia Code), then DejaVu Sans
+    Mono as universal fallback.
+
+    Safe at module-import time: if `probe_root` is None and no Tk root
+    exists yet, we skip font-list probing and return DejaVu — the
+    launcher calls this again later from _configure_theme() once the
+    real Tk root exists, which updates the FONT_* globals in place.
+    This avoids creating a throwaway Tk() at import (which blows up
+    under headless/no-DISPLAY and can conflict with the real root).
+    """
+    if sys.platform == "win32":
+        return "Consolas"
+    if sys.platform == "darwin":
+        return "Menlo"
+    # Linux: only probe if we already have a Tk interpreter to talk to.
+    try:
+        root = probe_root or tk._default_root
+        if root is None:
+            return "DejaVu Sans Mono"
+        import tkinter.font as _tkfont
+        families = set(_tkfont.families(root))
+        for cand in ("JetBrains Mono", "Fira Code", "Cascadia Code",
+                     "Source Code Pro", "Hack", "Ubuntu Mono",
+                     "DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono"):
+            if cand in families:
+                return cand
+    except Exception:
+        pass
+    return "DejaVu Sans Mono"
+
+def _pick_braille_font(probe_root=None) -> str:
+    """Pick a font with reliable Braille block coverage (U+2800–U+28FF).
+
+    Same safety contract as _pick_mono_font: needs a Tk root or
+    returns DejaVu without probing.
+    """
+    if sys.platform == "win32":
+        return "Consolas"
+    try:
+        root = probe_root or tk._default_root
+        if root is None:
+            return "DejaVu Sans Mono"
+        import tkinter.font as _tkfont
+        families = set(_tkfont.families(root))
+        for cand in ("DejaVu Sans Mono", "Noto Sans Mono",
+                     "Liberation Mono", "Ubuntu Mono"):
+            if cand in families:
+                return cand
+    except Exception:
+        pass
+    return "DejaVu Sans Mono"
+
+# Initial values — safe defaults, re-resolved once the real Tk root
+# exists (see _refresh_fonts() called from _configure_theme).
+_MONO = "Consolas" if sys.platform == "win32" else (
+        "Menlo" if sys.platform == "darwin" else "DejaVu Sans Mono")
+_BRAILLE_FONT = _MONO
+
 FONT_TITLE    = (_MONO, 15, "bold")
 FONT_SUBTITLE = (_MONO, 12)
 FONT_HEADER   = (_MONO, 11, "bold")
@@ -340,7 +427,35 @@ FONT_BODY_B   = (_MONO, 11, "bold")
 FONT_SMALL    = (_MONO, 10)
 FONT_SMALL_B  = (_MONO, 10, "bold")
 FONT_DIM      = (_MONO, 10)
-FONT_BRAILLE  = (_MONO, 12)
+FONT_BRAILLE  = (_BRAILLE_FONT, 12)
+
+def _refresh_fonts(root) -> None:
+    """Re-resolve the FONT_* globals after a real Tk root exists.
+
+    Called once from _configure_theme on first run. On Windows/macOS
+    this is effectively a no-op (platform fonts were already correct).
+    On Linux it upgrades DejaVu to JetBrains Mono / Fira Code / etc.
+    if one of those is installed.
+    """
+    global _MONO, _BRAILLE_FONT
+    global FONT_TITLE, FONT_SUBTITLE, FONT_HEADER
+    global FONT_BODY, FONT_BODY_B, FONT_SMALL, FONT_SMALL_B
+    global FONT_DIM, FONT_BRAILLE
+    new_mono = _pick_mono_font(root)
+    new_braille = _pick_braille_font(root)
+    if new_mono == _MONO and new_braille == _BRAILLE_FONT:
+        return
+    _MONO = new_mono
+    _BRAILLE_FONT = new_braille
+    FONT_TITLE    = (_MONO, 15, "bold")
+    FONT_SUBTITLE = (_MONO, 12)
+    FONT_HEADER   = (_MONO, 11, "bold")
+    FONT_BODY     = (_MONO, 11)
+    FONT_BODY_B   = (_MONO, 11, "bold")
+    FONT_SMALL    = (_MONO, 10)
+    FONT_SMALL_B  = (_MONO, 10, "bold")
+    FONT_DIM      = (_MONO, 10)
+    FONT_BRAILLE  = (_BRAILLE_FONT, 12)
 
 ACCENT_SOFT = "#60a5fa"
 ACCENT_TURBO = "#38bdf8"  # Sky blue — TurboQuant accent
@@ -403,6 +518,28 @@ class BrailleBar(tk.Canvas):
             return f.measure(_BRAILLE_FILLED)
         except Exception:
             return 9
+
+# ─── Themed tk.Checkbutton helper ────────────────────────────────────────────
+# tk.Checkbutton renders very differently across platforms. On Windows the
+# native theme paints a crisp checkmark regardless of our colors. On Linux
+# (X11) the indicator box is filled with `selectcolor` when checked and left
+# empty when unchecked — no checkmark. If `selectcolor` is close to the
+# widget background (as with our old bg_secondary on the dark theme), the
+# checked/unchecked states look almost identical. This helper fills the
+# indicator in the accent blue when checked, giving a clearly visible signal
+# on both OSes, and strips the 3D focus ring for a flat look.
+def themed_checkbutton(parent, theme, **kw):
+    kw.setdefault("bg", theme.bg)
+    kw.setdefault("fg", theme.fg)
+    kw.setdefault("activebackground", theme.bg)
+    kw.setdefault("activeforeground", theme.fg)
+    kw.setdefault("selectcolor", theme.accent)  # filled indicator when checked
+    kw.setdefault("highlightthickness", 0)      # no ugly Motif focus ring
+    kw.setdefault("bd", 0)
+    kw.setdefault("relief", "flat")
+    kw.setdefault("font", FONT_SMALL)
+    return tk.Checkbutton(parent, **kw)
+
 
 class HoverButton(tk.Canvas):
     """Colored button with hover effect, drawn on Canvas for full color control.
@@ -491,7 +628,7 @@ class HoverButton(tk.Canvas):
         if self._corner_glyph:
             self.create_text(w - 6, 5, text=self._corner_glyph,
                              fill="#ffffff", anchor="ne",
-                             font=("Consolas", 7, "bold"))
+                             font=(_MONO, 7, "bold"))
 
     def _rounded_rect(self, x1, y1, x2, y2, r, **kw):
         self.create_arc(x1, y1, x1+2*r, y1+2*r, start=90, extent=90, style="pieslice", **kw)
@@ -772,14 +909,73 @@ class ModelInfo:
     # 2026-04-07: TheTom v2 + Qwen 27B from "Q:\AI, Deeplearning, ...".
     has_unsafe_path: bool = False
 
+# Directory name patterns to skip during recursive scanning. These are
+# places where .gguf files may exist but are NOT user-selectable LLMs:
+# Ollama's blob store (opaque hash filenames), conda/pip caches,
+# virtualenvs, snap containers, build caches, hidden config dirs.
+# Match is case-insensitive on the basename of the directory.
+_SCAN_EXCLUDE_DIRS = frozenset({
+    # Python / package manager / env dirs
+    ".cache", ".conda", "conda-meta", ".local", ".venv", "venv", "venvs",
+    "miniconda3", "anaconda3", "__pycache__", "site-packages",
+    "pip-cache", ".npm", "node_modules",
+    # Ollama stores models under ~/.ollama/models/blobs/ as sha256-...
+    # These are real ggufs but have no human-readable name, so they're
+    # useless in the launcher UI.
+    ".ollama", "ollama",
+    # Snap and Flatpak containers
+    "snap", ".var", "flatpak",
+    # Browser / IDE / misc caches
+    "mozilla", ".mozilla", ".config", ".wine",
+    # Compile caches produced by unsloth etc.
+    "unsloth_compiled_cache",
+    # Build dirs
+    "build", "dist",
+    # System trash
+    ".trash", ".local/share/Trash",
+})
+
+# Minimum GGUF file size to be considered a "real" model. Anything
+# smaller is overwhelmingly vocab-only files (ggml-vocab-*.gguf are
+# typically <5 MB), stub test fixtures, or corrupted downloads. Real
+# quantized LLMs start around 500 MB even for tiny 1-2B models. We
+# pick 50 MB as a conservative lower bound — generous enough for
+# edge cases (embedding models, TinyLlama-1B-Q2) but eliminates every
+# vocab file and llama.cpp test stub.
+_MIN_MODEL_SIZE_BYTES = 50 * 1024 * 1024
+
+# Filename substrings that mark a GGUF as NOT a user-selectable model
+# regardless of size. These are files llama.cpp and some model
+# distributions ship for internal testing / tokenizer shipping.
+_FILENAME_JUNK_HINTS = (
+    "ggml-vocab-",   # vocabulary-only dumps from llama.cpp tests
+    "-vocab.gguf",   # same pattern, alt naming
+    ".tmp.gguf",     # partial downloads
+)
+
+def _is_junk_filename(fn: str) -> bool:
+    low = fn.lower()
+    return any(h in low for h in _FILENAME_JUNK_HINTS)
+
 def scan_models(models_dirs, recursive: bool = True) -> List[ModelInfo]:
     """Scan one or more directories for *.gguf files.
 
     Accepts either a single path (str) or a list of paths. When
     ``recursive`` is True (default), descends into subdirectories via
     ``os.walk``; otherwise only the top level of each directory is scanned.
-    Results are deduplicated by canonical (realpath) location, so overlapping
-    directories or symlinks won't list the same file twice.
+
+    Applies three filters so that pointing the launcher at a home
+    directory still yields a clean list of actual LLMs:
+      1. Skip common junk directories (venvs, .ollama blob store,
+         snap/flatpak containers, __pycache__, conda envs, unsloth
+         caches, etc.). Full list in _SCAN_EXCLUDE_DIRS.
+      2. Skip hidden directories (starting with "."), except the root
+         of a user-provided path (which may legitimately be hidden).
+      3. Skip files smaller than _MIN_MODEL_SIZE_BYTES (50 MB) and
+         files matching _FILENAME_JUNK_HINTS (ggml-vocab-*, etc.).
+
+    Results are deduplicated by canonical (realpath) location so
+    overlapping directories or symlinks won't list the same file twice.
     """
     # Normalize input to a list of non-empty strings
     if isinstance(models_dirs, str):
@@ -792,35 +988,65 @@ def scan_models(models_dirs, recursive: bool = True) -> List[ModelInfo]:
         if not os.path.isdir(models_dir):
             continue
         if recursive:
-            walker = os.walk(models_dir)
+            # Filter subdirectories in-place so os.walk doesn't descend
+            # into them. topdown=True (default) lets us mutate _dirs.
+            for root, subdirs, files in os.walk(models_dir, topdown=True):
+                # Prune junk and hidden dirs. Don't prune the scan root
+                # itself (user may have pointed at a hidden dir on purpose).
+                pruned = []
+                for d in subdirs:
+                    low = d.lower()
+                    if low in _SCAN_EXCLUDE_DIRS:
+                        continue
+                    # Hidden dir (".git", ".cache", ...) — skip unless
+                    # it's a direct child AND the user explicitly named
+                    # it. Cheapest check: skip all dotdirs.
+                    if d.startswith(".") and d not in (".",):
+                        continue
+                    pruned.append(d)
+                subdirs[:] = pruned
+                for f in files:
+                    _maybe_add_model(seen, root, f)
         else:
             try:
                 entries = os.listdir(models_dir)
             except OSError:
                 continue
-            walker = [(models_dir, [], entries)]
-        for root, _dirs, files in walker:
-            for f in files:
-                if not f.lower().endswith(".gguf"):
-                    continue
-                full_path = os.path.join(root, f)
-                try:
-                    key = os.path.realpath(full_path)
-                    if key in seen:
-                        continue
-                    size = os.path.getsize(full_path)
-                    seen[key] = ModelInfo(
-                        filename=f,
-                        path=full_path,
-                        size_bytes=size,
-                        size_gb=round(size / (1024**3), 1),
-                        has_unsafe_path=("," in full_path),
-                    )
-                except OSError:
-                    pass
+            for f in entries:
+                full = os.path.join(models_dir, f)
+                if os.path.isfile(full):
+                    _maybe_add_model(seen, models_dir, f)
+
     models = list(seen.values())
     models.sort(key=lambda m: m.size_bytes, reverse=True)
     return models
+
+def _maybe_add_model(seen: Dict[str, "ModelInfo"], root: str, filename: str) -> None:
+    """Helper for scan_models — size/filename filter + dedup insertion."""
+    if not filename.lower().endswith(".gguf"):
+        return
+    if _is_junk_filename(filename):
+        return
+    full_path = os.path.join(root, filename)
+    try:
+        size = os.path.getsize(full_path)
+    except OSError:
+        return
+    if size < _MIN_MODEL_SIZE_BYTES:
+        return
+    try:
+        key = os.path.realpath(full_path)
+    except OSError:
+        key = full_path
+    if key in seen:
+        return
+    seen[key] = ModelInfo(
+        filename=filename,
+        path=full_path,
+        size_bytes=size,
+        size_gb=round(size / (1024**3), 1),
+        has_unsafe_path=("," in full_path),
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION: Config Management
@@ -1376,6 +1602,64 @@ class TurboQuantQLauncher(tk.Tk):
     def _configure_theme(self):
         t = self.theme
         self.configure(bg=t.bg)
+
+        # tk_setPalette: the nuclear option. Sets background /
+        # foreground / activeBackground / activeForeground /
+        # selectBackground / selectForeground / highlightBackground /
+        # highlightColor / insertBackground / disabledForeground /
+        # troughColor for EVERY Tk widget class at once — including
+        # the obscure ones that show up in file dialogs (Spinbox,
+        # legacy internal popup Frames, tearoff Menu stubs, etc.)
+        # that we'd otherwise have to enumerate by hand.
+        #
+        # Must run BEFORE any widget is created, or only new widgets
+        # pick it up. Here it runs as the first thing on rebuild
+        # (re-config runs before _build_header).
+        try:
+            self.tk.call(
+                "tk_setPalette",
+                "background",          t.bg,
+                "foreground",          t.fg,
+                "activeBackground",    t.accent,
+                "activeForeground",    "#ffffff",
+                "selectBackground",    t.accent,
+                "selectForeground",    "#ffffff",
+                "selectColor",         t.accent,
+                "highlightBackground", t.bg,
+                "highlightColor",      t.accent,
+                "insertBackground",    t.fg,
+                "disabledForeground",  t.fg_dim,
+                "troughColor",         t.bg_secondary,
+            )
+        except Exception:
+            pass
+
+        # Upgrade fonts now that a real Tk root exists. On Linux this
+        # may swap DejaVu Sans Mono for JetBrains Mono / Fira Code /
+        # Cascadia / etc. if installed. Safe to call repeatedly — it
+        # only rebuilds the FONT_* globals if the result differs, and
+        # widgets constructed after this point will see the new fonts.
+        if not getattr(self, "_fonts_refreshed", False):
+            _refresh_fonts(self)
+            self._fonts_refreshed = True
+
+        # HiDPI auto-scaling. Tk has no built-in DPI awareness, so on a
+        # 4K monitor every widget renders at ~50% of its intended size.
+        # We detect the screen height once and bump the Tk scaling
+        # factor accordingly. Runs only on first theme-configure (not
+        # on the live-swap rebuild) so repeated toggles don't compound.
+        if not getattr(self, "_tk_scaling_applied", False):
+            try:
+                sh = self.winfo_screenheight()
+                if sh >= 2000:      # 4K class
+                    self.tk.call("tk", "scaling", 2.0)
+                elif sh >= 1600:    # 2.5K / QHD class
+                    self.tk.call("tk", "scaling", 1.5)
+                # Otherwise leave default (FHD / 1080p).
+                self._tk_scaling_applied = True
+            except Exception:
+                pass
+
         s = ttk.Style(self)
         s.theme_use("clam")
         s.configure(".", background=t.bg, foreground=t.fg, fieldbackground=t.entry_bg,
@@ -1384,41 +1668,231 @@ class TurboQuantQLauncher(tk.Tk):
         s.configure("TLabel", background=t.bg, foreground=t.fg, font=FONT_BODY)
         s.configure("H.TFrame", background=t.bg_header)
         s.configure("H.TLabel", background=t.bg_header, foreground=t.fg, font=FONT_BODY)
-        s.configure("TCombobox", fieldbackground=t.bg_secondary, foreground=t.fg,
-                    background=t.bg_secondary, selectbackground=t.bg_secondary,
-                    selectforeground=t.fg, arrowcolor=t.fg,
-                    font=FONT_BODY, padding=(4, 2))
-        s.map("TCombobox",
-              fieldbackground=[("readonly", t.bg_secondary),
-                               ("disabled", t.bg_secondary)],
-              foreground=[("readonly", t.fg), ("disabled", t.fg_dim)],
-              selectbackground=[("readonly", t.bg_secondary)],
-              selectforeground=[("readonly", t.fg)],
-              background=[("active", t.bg_secondary),
-                          ("readonly", t.bg_secondary)])
-        s.configure("TCheckbutton", background=t.bg, foreground=t.fg,
-                    indicatorcolor=t.bg_secondary, font=FONT_BODY)
+        # ttk.Entry styling — used in Settings/Paths dialog. Clam's
+        # default renders a near-invisible 1px border on dark themes;
+        # we thicken it and tint it in the accent colour when focused.
+        s.configure("TEntry",
+                    fieldbackground=t.entry_bg, foreground=t.fg,
+                    insertcolor=t.fg,
+                    bordercolor=t.border, lightcolor=t.border, darkcolor=t.border,
+                    borderwidth=1, padding=(4, 3))
+        s.map("TEntry",
+              bordercolor=[("focus", t.accent)],
+              lightcolor=[("focus", t.accent)],
+              darkcolor=[("focus", t.accent)])
+        # ttk.Checkbutton — the clam default indicator is barely visible
+        # against bg_secondary (~3 values apart on dark). Use the border
+        # colour for the frame and a solid accent fill when selected.
+        s.configure("TCheckbutton",
+                    background=t.bg, foreground=t.fg,
+                    indicatorbackground=t.entry_bg,
+                    indicatorforeground=t.fg,
+                    indicatorcolor=t.entry_bg,
+                    bordercolor=t.border,
+                    lightcolor=t.border, darkcolor=t.border,
+                    focusthickness=1,
+                    padding=(2, 1),
+                    font=FONT_BODY)
         s.map("TCheckbutton",
               background=[("active", t.bg)],
               foreground=[("disabled", t.fg_dim)],
-              indicatorcolor=[("selected", t.accent), ("pressed", t.accent)])
+              indicatorcolor=[("selected", t.accent),
+                              ("pressed", t.accent),
+                              ("!selected", t.entry_bg)],
+              bordercolor=[("focus", t.accent)])
+        # ttk.Scrollbar — styled so the model-list scrollbar matches the
+        # dark theme. Clam honours these vars; on Windows the native
+        # theme wins but it still looks fine there.
+        s.configure("Vertical.TScrollbar",
+                    background=t.bg_secondary,
+                    troughcolor=t.bg,
+                    bordercolor=t.bg,
+                    arrowcolor=t.fg_secondary,
+                    lightcolor=t.bg_secondary,
+                    darkcolor=t.bg_secondary,
+                    gripcount=0, relief="flat")
+        s.map("Vertical.TScrollbar",
+              background=[("active", t.border),
+                          ("pressed", t.accent)],
+              arrowcolor=[("active", t.fg),
+                          ("disabled", t.fg_dim)])
+        s.configure("Horizontal.TScrollbar",
+                    background=t.bg_secondary,
+                    troughcolor=t.bg,
+                    bordercolor=t.bg,
+                    arrowcolor=t.fg_secondary,
+                    lightcolor=t.bg_secondary,
+                    darkcolor=t.bg_secondary,
+                    gripcount=0, relief="flat")
+        s.map("Horizontal.TScrollbar",
+              background=[("active", t.border),
+                          ("pressed", t.accent)],
+              arrowcolor=[("active", t.fg),
+                          ("disabled", t.fg_dim)])
         s.configure("TSeparator", background=t.border)
-        # Combobox dropdown listbox (popup) — explicit colors for all states
-        # so entries remain readable on both dark and light themes. Without
-        # selectBackground/selectForeground the hovered row is unreadable on
-        # Linux ttk clam.
-        self.option_add("*TCombobox*Listbox.background", t.bg_secondary)
-        self.option_add("*TCombobox*Listbox.foreground", t.fg)
+
+        # ── ttk.Combobox + Treeview theming ─────────────────────────
+        # Tk's filedialog on Linux builds its "directory breadcrumb"
+        # row using a ttk.Combobox, and on Tk 8.6+ the file list is a
+        # ttk.Treeview. Neither widget reads the plain option database,
+        # they only honour ttk.Style() — so we have to style them here
+        # even though the launcher itself doesn't use them directly.
+        s.configure("TCombobox",
+                    fieldbackground=t.entry_bg,
+                    background=t.bg_secondary,
+                    foreground=t.fg,
+                    arrowcolor=t.fg,
+                    bordercolor=t.border,
+                    lightcolor=t.border, darkcolor=t.border,
+                    insertcolor=t.fg,
+                    selectbackground=t.accent,
+                    selectforeground="#ffffff",
+                    padding=(4, 2))
+        s.map("TCombobox",
+              fieldbackground=[("readonly", t.entry_bg),
+                               ("disabled", t.bg_secondary),
+                               ("focus",    t.entry_bg)],
+              foreground=[("readonly", t.fg),
+                          ("disabled", t.fg_dim)],
+              background=[("active", t.bg_secondary),
+                          ("readonly", t.bg_secondary)],
+              bordercolor=[("focus", t.accent)],
+              arrowcolor=[("disabled", t.fg_dim),
+                          ("active", t.fg)])
+        # The Combobox dropdown popup is a Listbox — it reads the
+        # option database, NOT ttk.Style. So we set it via option_add
+        # with the TCombobox listbox pattern.
+        self.option_add("*TCombobox*Listbox.background",       t.bg_secondary)
+        self.option_add("*TCombobox*Listbox.foreground",       t.fg)
         self.option_add("*TCombobox*Listbox.selectBackground", t.accent)
-        self.option_add("*TCombobox*Listbox.selectForeground", t.bg)
-        self.option_add("*TCombobox*Listbox.font", FONT_BODY)
-        # Plain tk OptionMenu / Menu widgets used in some places also inherit
-        # from the option database — keep them readable too.
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.option_add("*TCombobox*Listbox.borderWidth",      "0")
+        self.option_add("*TCombobox*Listbox.relief",           "flat")
+        self.option_add("*TCombobox*Listbox.font",             FONT_BODY)
+
+        # Treeview = file list inside the filedialog on modern Tk.
+        s.configure("Treeview",
+                    background=t.bg_secondary,
+                    foreground=t.fg,
+                    fieldbackground=t.bg_secondary,
+                    bordercolor=t.border,
+                    lightcolor=t.border, darkcolor=t.border,
+                    borderwidth=0,
+                    rowheight=22)
+        s.map("Treeview",
+              background=[("selected", t.accent)],
+              foreground=[("selected", "#ffffff")])
+        s.configure("Treeview.Heading",
+                    background=t.bg_header,
+                    foreground=t.fg,
+                    relief="flat",
+                    borderwidth=0,
+                    font=FONT_SMALL_B)
+        s.map("Treeview.Heading",
+              background=[("active", t.border)])
+        # TButton: used by the filedialog's OK/Cancel row.
+        s.configure("TButton",
+                    background=t.bg_secondary,
+                    foreground=t.fg,
+                    bordercolor=t.border,
+                    lightcolor=t.border, darkcolor=t.border,
+                    borderwidth=1, padding=(8, 4), relief="flat")
+        s.map("TButton",
+              background=[("active", t.accent),
+                          ("pressed", t.accent),
+                          ("disabled", t.bg_secondary)],
+              foreground=[("active", "#ffffff"),
+                          ("pressed", "#ffffff"),
+                          ("disabled", t.fg_dim)],
+              bordercolor=[("focus", t.accent)])
+        # Plain tk Menu widgets inherit via the option database.
+        # (Note: there are currently no ttk.Combobox / tk.OptionMenu
+        # widgets in the launcher — KV/LA/Q-N-C selectors are custom
+        # HoverButton grids — so we don't style TCombobox here.)
         self.option_add("*Menu.background", t.bg_secondary)
         self.option_add("*Menu.foreground", t.fg)
         self.option_add("*Menu.selectColor", t.accent)
         self.option_add("*Menu.activeBackground", t.accent)
         self.option_add("*Menu.activeForeground", t.bg)
+
+        # ── Tk filedialog theming ────────────────────────────────────
+        # The built-in filedialog (tk.filedialog.askopenfilename /
+        # askdirectory) is implemented in Tcl using bare tk.Frame,
+        # tk.Listbox, tk.Entry, tk.Button, tk.Label, tk.Scrollbar —
+        # NOT ttk widgets. They ignore all ttk.Style() config and
+        # default to the Motif look (white background, black 3D
+        # borders, unreadable against our app). The only way to
+        # theme them is Tk's classic option database: we push bg/fg
+        # for every widget class the dialog uses, then the dialog
+        # picks those up at construction time.
+        #
+        # Patterns use "*Class" so they only match widgets that
+        # don't set the attribute explicitly. Our own widgets pass
+        # bg=/fg= directly and take precedence, so this is safe to
+        # apply globally — it only fills in where nothing else was
+        # said, which is exactly inside the filedialog.
+        fg_on_accent = "#ffffff"
+        _opts = [
+            # Generic containers
+            ("*Frame.background",           t.bg),
+            ("*Toplevel.background",        t.bg),
+            ("*Label.background",           t.bg),
+            ("*Label.foreground",           t.fg),
+            # Buttons (the "Open"/"Cancel"/"Save" row)
+            ("*Button.background",          t.bg_secondary),
+            ("*Button.foreground",          t.fg),
+            ("*Button.activeBackground",    t.accent),
+            ("*Button.activeForeground",    fg_on_accent),
+            ("*Button.highlightBackground", t.bg),
+            ("*Button.highlightColor",      t.accent),
+            ("*Button.borderWidth",         "1"),
+            ("*Button.relief",              "flat"),
+            # Entry (the filename / path bar)
+            ("*Entry.background",           t.entry_bg),
+            ("*Entry.foreground",           t.fg),
+            ("*Entry.insertBackground",     t.fg),
+            ("*Entry.selectBackground",     t.accent),
+            ("*Entry.selectForeground",     fg_on_accent),
+            ("*Entry.highlightBackground",  t.bg),
+            ("*Entry.highlightColor",       t.accent),
+            ("*Entry.borderWidth",          "1"),
+            ("*Entry.relief",               "flat"),
+            # Listbox (the file list). This is the big ugly one on
+            # Motif — white canvas, black text, no theme awareness.
+            ("*Listbox.background",         t.bg_secondary),
+            ("*Listbox.foreground",         t.fg),
+            ("*Listbox.selectBackground",   t.accent),
+            ("*Listbox.selectForeground",   fg_on_accent),
+            ("*Listbox.highlightBackground", t.bg),
+            ("*Listbox.highlightColor",     t.accent),
+            ("*Listbox.borderWidth",        "0"),
+            ("*Listbox.relief",             "flat"),
+            # Scrollbar on the listbox
+            ("*Scrollbar.background",       t.bg_secondary),
+            ("*Scrollbar.troughColor",      t.bg),
+            ("*Scrollbar.activeBackground", t.border),
+            ("*Scrollbar.highlightBackground", t.bg),
+            ("*Scrollbar.borderWidth",      "0"),
+            ("*Scrollbar.relief",           "flat"),
+            # The directory dropdown (tk_chooseDirectory uses a
+            # Menubutton with an attached Menu)
+            ("*Menubutton.background",      t.bg_secondary),
+            ("*Menubutton.foreground",      t.fg),
+            ("*Menubutton.activeBackground", t.accent),
+            ("*Menubutton.activeForeground", fg_on_accent),
+            # Checkbuttons and Radiobuttons that appear inside some
+            # filedialog variants ("Show hidden files")
+            ("*Checkbutton.background",     t.bg),
+            ("*Checkbutton.foreground",     t.fg),
+            ("*Checkbutton.selectColor",    t.accent),
+            ("*Checkbutton.activeBackground", t.bg),
+            ("*Checkbutton.activeForeground", t.fg),
+            ("*Radiobutton.background",     t.bg),
+            ("*Radiobutton.foreground",     t.fg),
+            ("*Radiobutton.selectColor",    t.accent),
+        ]
+        for pattern, value in _opts:
+            self.option_add(pattern, value)
 
     # ─── Header ───────────────────────────────────────────────────────────
 
@@ -1437,14 +1911,17 @@ class TurboQuantQLauncher(tk.Tk):
 
         # Theme toggle (right-aligned). Click the label to live-swap
         # between dark and light. The label always shows the *current*
-        # mode — "🌙 Dark" while dark, "☀ Light" while light — so the
+        # mode — "☾ Dark" while dark, "☀ Light" while light — so the
         # user sees immediate visual feedback after clicking. Backed by
         # self._light_var so the rest of _on_toggle_theme can read it
         # without caring which widget triggered the change.
+        # Note: we use ☾ U+263E (BMP) instead of 🌙 U+1F319 (Supplementary
+        # Plane). Linux distros without Noto Color Emoji render 🌙 as a
+        # tofu box; ☾ is covered by DejaVu Sans Mono and JetBrains Mono.
         self._light_var = tk.BooleanVar(value=not self.is_dark)
         theme_lbl = tk.Label(
             row1,
-            text=("☀ Light" if not self.is_dark else "🌙 Dark"),
+            text=("\u2600 Light" if not self.is_dark else "\u263E Dark"),
             font=FONT_SMALL,
             bg=t.bg_header, fg=t.fg_secondary,
             cursor="hand2",
@@ -1868,23 +2345,20 @@ class TurboQuantQLauncher(tk.Tk):
         timeout_entry.pack(side="left", padx=(4, 0))
 
         self._no_think_var = tk.BooleanVar(value=self.cfg.get("no_thinking", False))
-        cb_think = tk.Checkbutton(row, text="No Thinking", variable=self._no_think_var,
-                                   font=FONT_SMALL, bg=t.bg, fg=t.fg, selectcolor=t.bg_secondary,
-                                   activebackground=t.bg, activeforeground=t.fg)
+        cb_think = themed_checkbutton(row, t, text="No Thinking",
+                                       variable=self._no_think_var)
         cb_think.pack(side="left", padx=(8, 0))
         ToolTip(cb_think, "Disable reasoning/thinking mode (--reasoning off)", t)
 
         self._bench_var = tk.BooleanVar(value=self.cfg.get("benchmark", False))
-        cb_bench = tk.Checkbutton(row, text="Benchmark", variable=self._bench_var,
-                                   font=FONT_SMALL, bg=t.bg, fg=t.fg, selectcolor=t.bg_secondary,
-                                   activebackground=t.bg, activeforeground=t.fg)
+        cb_bench = themed_checkbutton(row, t, text="Benchmark",
+                                       variable=self._bench_var)
         cb_bench.pack(side="left", padx=(8, 0))
         ToolTip(cb_bench, "When checked, double-click runs llama-bench\ninstead of starting the server", t)
 
         self._bench_all_var = tk.BooleanVar(value=False)
-        cb_bench_all = tk.Checkbutton(row, text="Bench All", variable=self._bench_all_var,
-                                       font=FONT_SMALL, bg=t.bg, fg=t.fg, selectcolor=t.bg_secondary,
-                                       activebackground=t.bg, activeforeground=t.fg)
+        cb_bench_all = themed_checkbutton(row, t, text="Bench All",
+                                           variable=self._bench_all_var)
         cb_bench_all.pack(side="left", padx=(2, 0))
         ToolTip(cb_bench_all, "Activate: selects ALL KV + LA for benchmarking.\n"
                               "Click individual KV/LA buttons to deselect.\n"
@@ -3375,8 +3849,14 @@ class TurboQuantQLauncher(tk.Tk):
         scroll_frame.pack(fill="both", expand=True)
 
         self._canvas = tk.Canvas(scroll_frame, bg=t.bg, highlightthickness=0, bd=0)
-        self._scrollbar = tk.Scrollbar(scroll_frame, orient="vertical",
-                                        command=self._canvas.yview)
+        # ttk.Scrollbar picks up the themed style (see _configure_theme:
+        # "Vertical.TScrollbar"), whereas tk.Scrollbar renders as the
+        # legacy Motif widget on Linux — ignoring the dark theme and
+        # sticking out as a grey 3D block. Windows also benefits: the
+        # ttk widget integrates cleaner with the overall look.
+        self._scrollbar = ttk.Scrollbar(scroll_frame, orient="vertical",
+                                         command=self._canvas.yview,
+                                         style="Vertical.TScrollbar")
         self._scrollbar.pack(side="right", fill="y")
         self._canvas.pack(side="left", fill="both", expand=True)
         self._canvas.configure(yscrollcommand=self._scrollbar.set)
@@ -3387,8 +3867,27 @@ class TurboQuantQLauncher(tk.Tk):
         self._inner_frame.bind("<Configure>",
                                lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
         self._canvas.bind("<Configure>", self._on_canvas_resize)
-        self._canvas.bind_all("<MouseWheel>",
-                              lambda e: self._canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+        # Cross-platform mousewheel binding. Windows + macOS fire
+        # <MouseWheel> with e.delta in ±120 increments. X11/Wayland on
+        # Linux fire <Button-4> (up) and <Button-5> (down) instead —
+        # <MouseWheel> never arrives. We bind all three and route to the
+        # same yview_scroll call so the model list scrolls on every
+        # platform.
+        def _on_mousewheel(event):
+            # Windows/macOS path: delta is ±120 per notch.
+            if event.delta:
+                step = -1 if event.delta > 0 else 1
+            # Linux path: num is 4 (up) or 5 (down), delta is 0.
+            elif getattr(event, "num", 0) == 4:
+                step = -1
+            elif getattr(event, "num", 0) == 5:
+                step = 1
+            else:
+                return
+            self._canvas.yview_scroll(step, "units")
+        self._canvas.bind_all("<MouseWheel>", _on_mousewheel)   # Win + macOS
+        self._canvas.bind_all("<Button-4>",   _on_mousewheel)   # Linux X11 up
+        self._canvas.bind_all("<Button-5>",   _on_mousewheel)   # Linux X11 down
 
     def _on_canvas_resize(self, event):
         self._canvas.itemconfig(self._canvas_window, width=event.width)
@@ -4434,7 +4933,7 @@ class TurboQuantQLauncher(tk.Tk):
 
         server_exe = self.cfg.get("llama_server_path", "")
         if not os.path.isfile(server_exe):
-            self._log(f"llama-server.exe not found: {server_exe}", "error")
+            self._log(f"{exe_name('llama-server')} not found: {server_exe}", "error")
             self._show_paths_dialog()
             return
 
@@ -4873,15 +5372,14 @@ class TurboQuantQLauncher(tk.Tk):
         rec_row = tk.Frame(dlg, bg=t.bg)
         rec_row.pack(fill="x", padx=20, pady=(6, 8))
         recursive_var = tk.BooleanVar(value=bool(self.cfg.get("llm_models_recursive", True)))
-        cb_rec = tk.Checkbutton(rec_row,
-                                 text="Include subdirectories (recursive scan)",
-                                 variable=recursive_var,
-                                 font=FONT_BODY, bg=t.bg, fg=t.fg,
-                                 selectcolor=t.bg_secondary,
-                                 activebackground=t.bg, activeforeground=t.fg)
+        cb_rec = themed_checkbutton(rec_row,
+                                     t,
+                                     text="Include subdirectories (recursive scan)",
+                                     variable=recursive_var,
+                                     font=FONT_BODY)
         cb_rec.pack(side="left")
 
-        tk.Label(dlg, text="llama-server.exe Path (active):", font=FONT_BODY_B,
+        tk.Label(dlg, text=f"{exe_name('llama-server')} Path (active):", font=FONT_BODY_B,
                  bg=t.bg, fg=t.fg).pack(padx=20, anchor="w")
         server_frame = tk.Frame(dlg, bg=t.bg)
         server_frame.pack(fill="x", padx=20, pady=(2, 8))
@@ -4896,7 +5394,7 @@ class TurboQuantQLauncher(tk.Tk):
         tk.Label(dlg, text=f"Quick-Switch Slots (up to {MAX_SERVER_SLOTS}):",
                  font=FONT_BODY_B, bg=t.bg, fg=t.fg).pack(padx=20, anchor="w")
         tk.Label(dlg,
-                 text="Bookmark additional llama-server.exe builds here — "
+                 text=f"Bookmark additional {exe_name('llama-server')} builds here — "
                       "they appear as one-click buttons in the footer.",
                  font=FONT_BODY, bg=t.bg, fg=t.fg_dim,
                  wraplength=680, justify="left").pack(padx=20, anchor="w", pady=(0, 4))
@@ -4962,12 +5460,25 @@ class TurboQuantQLauncher(tk.Tk):
                 if not path or not os.path.isfile(path):
                     return False
                 name = os.path.basename(path).lower()
-                # Accept llama-server, llama-server.exe, and symlinks pointing to it.
-                # Reject .sh scripts, .bat, .py, and obviously wrong things.
+                # Reject obviously wrong things regardless of OS.
                 bad_suffixes = (".sh", ".bat", ".py", ".json", ".md", ".txt")
                 if name.endswith(bad_suffixes):
                     return False
-                return "llama-server" in name or name == exe_name("llama-server")
+                # Filename sanity: either the POSIX binary name, the
+                # Windows variant, or any name containing 'llama-server'
+                # (covers symlinks and custom suffixes like -madreag).
+                name_ok = ("llama-server" in name
+                           or name == exe_name("llama-server"))
+                if not name_ok:
+                    return False
+                # On POSIX, also require the executable bit. A file
+                # named llama-server with no +x set is a broken copy
+                # (common after a failed rsync or archive extract) and
+                # would silently fail at start time.
+                if not IS_WINDOWS:
+                    if not os.access(path, os.X_OK):
+                        return False
+                return True
             if not _looks_like_llama_server(active):
                 # Try to rescue from slots
                 for cand in slots_clean:
@@ -5002,15 +5513,193 @@ class TurboQuantQLauncher(tk.Tk):
         dlg.update_idletasks()
         self._center_window(dlg, 720, dlg.winfo_reqheight())
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # SECTION: Themed File/Directory Pickers (Tk custom)
+    # ═══════════════════════════════════════════════════════════════════════
+    # Tk's built-in filedialog is unthemeable — it uses a mix of tk::entry,
+    # ttk::combobox, custom IconList canvas, and xmfbox widgets that each
+    # ignore a different theming mechanism. Even with full option_add +
+    # ttk.Style coverage, some parts still render white. We sidestep the
+    # whole mess by shipping our own minimal pickers built from Tk
+    # primitives we already style.
+
+    def _themed_picker(self, initial: str, title: str = "Open",
+                       pick_files: bool = False,
+                       filename_patterns: Optional[List[str]] = None) -> str:
+        """Minimal themed file/directory picker.
+
+        pick_files=False  -> returns a directory path or ""
+        pick_files=True   -> returns a file path or ""
+        filename_patterns -> list of fnmatch-style patterns to filter files
+                             (e.g. ['llama-server*']). None = show all.
+        """
+        import fnmatch
+        t = self.theme
+
+        dlg = tk.Toplevel(self)
+        dlg.title(title)
+        dlg.configure(bg=t.bg)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        state = {"result": "", "current": os.path.abspath(
+            initial if initial and os.path.isdir(initial) else os.path.expanduser("~"))}
+
+        # ── Top row: path entry + Up button ──────────────────────────────
+        top = tk.Frame(dlg, bg=t.bg)
+        top.pack(fill="x", padx=10, pady=(10, 4))
+        tk.Label(top, text="Path:", font=FONT_BODY_B,
+                 bg=t.bg, fg=t.fg).pack(side="left")
+        path_var = tk.StringVar(value=state["current"])
+        path_entry = tk.Entry(top, textvariable=path_var, font=FONT_BODY,
+                               bg=t.entry_bg, fg=t.fg,
+                               insertbackground=t.fg,
+                               selectbackground=t.accent, selectforeground="#ffffff",
+                               relief="flat", bd=2, highlightthickness=1,
+                               highlightbackground=t.border,
+                               highlightcolor=t.accent)
+        path_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
+        HoverButton(top, t, text="↑ Up", color=t.border, width=60, height=24,
+                    command=lambda: _go_to(os.path.dirname(state["current"]))).pack(side="left")
+
+        # ── File/Folder list (Listbox + scrollbar) ───────────────────────
+        list_frame = tk.Frame(dlg, bg=t.bg)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=4)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical",
+                                style="Vertical.TScrollbar")
+        scroll.pack(side="right", fill="y")
+        listbox = tk.Listbox(list_frame, font=FONT_BODY,
+                              bg=t.bg_secondary, fg=t.fg,
+                              selectbackground=t.accent, selectforeground="#ffffff",
+                              activestyle="none",
+                              relief="flat", bd=0, highlightthickness=0,
+                              yscrollcommand=scroll.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scroll.config(command=listbox.yview)
+
+        # ── Button row ───────────────────────────────────────────────────
+        btn_row = tk.Frame(dlg, bg=t.bg)
+        btn_row.pack(fill="x", padx=10, pady=(4, 10))
+
+        ok_label = "Open" if pick_files else "Select Folder"
+        def _commit(path: str):
+            state["result"] = path
+            dlg.destroy()
+
+        ok_btn = HoverButton(btn_row, t, text=ok_label, color=t.accent,
+                              width=130, height=28,
+                              command=lambda: _on_ok())
+        ok_btn.pack(side="right", padx=(6, 0))
+        HoverButton(btn_row, t, text="Cancel", color=t.border,
+                    width=100, height=28,
+                    command=dlg.destroy).pack(side="right")
+
+        # ── Navigation helpers ───────────────────────────────────────────
+        def _refresh():
+            listbox.delete(0, "end")
+            cur = state["current"]
+            path_var.set(cur)
+            try:
+                entries = sorted(os.listdir(cur))
+            except OSError as e:
+                listbox.insert("end", f"[error: {e}]")
+                return
+            dirs, files = [], []
+            for name in entries:
+                if name.startswith("."):
+                    continue  # hide dotfiles/dirs
+                full = os.path.join(cur, name)
+                if os.path.isdir(full):
+                    dirs.append(name)
+                elif pick_files:
+                    if filename_patterns:
+                        if any(fnmatch.fnmatch(name, p) for p in filename_patterns):
+                            files.append(name)
+                    else:
+                        files.append(name)
+            for d in dirs:
+                listbox.insert("end", "▸  " + d + "/")
+            for f in files:
+                listbox.insert("end", "   " + f)
+
+        def _go_to(new_path: str):
+            if new_path and os.path.isdir(new_path):
+                state["current"] = os.path.abspath(new_path)
+                _refresh()
+
+        def _on_double_click(_evt=None):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            raw = listbox.get(sel[0])
+            # Strip "▸  " or "   " prefix and trailing "/"
+            name = raw[3:].rstrip("/")
+            full = os.path.join(state["current"], name)
+            if os.path.isdir(full):
+                _go_to(full)
+            elif pick_files and os.path.isfile(full):
+                _commit(full)
+
+        def _on_ok():
+            if pick_files:
+                sel = listbox.curselection()
+                if sel:
+                    raw = listbox.get(sel[0])
+                    name = raw[3:].rstrip("/")
+                    full = os.path.join(state["current"], name)
+                    if os.path.isfile(full):
+                        _commit(full)
+                        return
+                # Else fall through: user may have typed a path
+                typed = path_var.get().strip()
+                if typed and os.path.isfile(typed):
+                    _commit(typed)
+            else:
+                # Folder mode: use the typed/current path
+                target = path_var.get().strip()
+                if target and os.path.isdir(target):
+                    _commit(target)
+                elif os.path.isdir(state["current"]):
+                    _commit(state["current"])
+
+        def _on_path_enter(_evt=None):
+            typed = path_var.get().strip()
+            if os.path.isdir(typed):
+                _go_to(typed)
+
+        listbox.bind("<Double-Button-1>", _on_double_click)
+        listbox.bind("<Return>", _on_double_click)
+        path_entry.bind("<Return>", _on_path_enter)
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+
+        _refresh()
+        path_entry.icursor("end")
+        listbox.focus_set()
+
+        # Size + center
+        dlg.update_idletasks()
+        w, h = 720, 500
+        self._center_window(dlg, w, h)
+        dlg.wait_window()
+        return state["result"]
+
     def _browse_dir(self, var: tk.StringVar):
-        path = filedialog.askdirectory(initialdir=var.get())
+        initial = var.get() or os.path.expanduser("~")
+        path = self._themed_picker(initial, title="Select folder",
+                                    pick_files=False)
         if path:
             var.set(path)
 
     def _browse_file(self, var: tk.StringVar):
-        path = filedialog.askopenfilename(
-            initialdir=os.path.dirname(var.get()),
-            filetypes=([("Executable", "*.exe"), ("All files", "*.*")] if IS_WINDOWS else [("All files", "*.*")]))
+        initial_dir = os.path.dirname(var.get()) if var.get() else os.path.expanduser("~")
+        if IS_WINDOWS:
+            patterns = ["*.exe"]
+        else:
+            patterns = ["llama-server*"]
+        # Allow user to turn off filter by re-entering an unfiltered path.
+        path = self._themed_picker(initial_dir, title="Select file",
+                                    pick_files=True,
+                                    filename_patterns=patterns)
         if path:
             var.set(path)
 
