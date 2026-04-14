@@ -17,6 +17,7 @@ Features:
 - NVIDIA + AMD + Intel + Apple GPU detection
 - Quick-switch slot bookmarks for multiple llama-server.exe builds
 - Bench All matrix mode (KV × LA × Depth) with configurable timeout
+- Vision model support: auto-attaches mmproj-*.gguf next to VL models (v0.54)
 - Server log output with timestamps
 - Persistent JSON config
 
@@ -70,7 +71,7 @@ def no_console_kwargs() -> dict:
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.53"
+APP_VERSION = "0.54"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -1006,6 +1007,7 @@ _FILENAME_JUNK_HINTS = (
     "ggml-vocab-",   # vocabulary-only dumps from llama.cpp tests
     "-vocab.gguf",   # same pattern, alt naming
     ".tmp.gguf",     # partial downloads
+    "mmproj",        # v0.54: companion vision projector, auto-attached
 )
 
 def _is_junk_filename(fn: str) -> bool:
@@ -3973,6 +3975,23 @@ class TurboQuantQLauncher(tk.Tk):
 
     # ─── Footer ───────────────────────────────────────────────────────────
 
+    def _measure_label_group_width(self, labels, bold: bool = False,
+                                   h_pad: int = 20) -> int:
+        """Uniform width for a group of button labels.
+
+        Sizes to the widest label in the group using tkfont.measure() so
+        the result honors Tk's current scaling factor. h_pad is the total
+        horizontal padding (split left+right inside the button canvas).
+        bold controls whether we measure against mono bold or regular —
+        must match the font actually passed to HoverButton.
+        """
+        import tkinter.font as tkfont
+        f = tkfont.Font(family=_MONO, size=10,
+                        weight="bold" if bold else "normal")
+        if not labels:
+            return 80
+        return max(f.measure(l) for l in labels) + h_pad
+
     def _build_footer(self):
         t = self.theme
         # side="bottom" anchors the footer to the window bottom edge
@@ -3983,41 +4002,50 @@ class TurboQuantQLauncher(tk.Tk):
         bar.pack(side="bottom", fill="x", padx=16, pady=(6, 8))
         tk.Frame(self, height=1, bg=t.border).pack(side="bottom", fill="x")
 
-        # Footer button width: Linux's default mono fonts (DejaVu Sans
-        # Mono etc.) are wider than Windows' Consolas at the same point
-        # size, so "Update Binaries" overflows 130 px. Give a little
-        # more room on non-Windows. HiDPI scaling multiplies this
-        # downstream, so the absolute value can stay modest.
-        _BTN_W = 130 if IS_WINDOWS else 160
+        # v0.54: three independent button groups, each with its own uniform
+        # width sized to the widest label in that group. This keeps short
+        # labels ("About") from being stretched to match long ones
+        # ("Update Binaries"). FONT_SMALL (non-bold) gives a lighter,
+        # more filigree appearance than the previous FONT_SMALL_B.
+        # Previous hard-coded widths (130/160, 80/100, 168/200) are gone —
+        # tkfont.measure() automatically handles Linux's wider mono fonts
+        # (DejaVu Sans Mono etc.) and Tk's HiDPI scaling factor.
         _BTN_H = 28
+        _H_PAD = 20   # ~1 char padding each side at mono 10
+
+        # Group A: file-ops (left)
+        group_a_w = self._measure_label_group_width(
+            ["Rescan Models", "Update Binaries"], bold=False, h_pad=_H_PAD)
         HoverButton(bar, t, text="Rescan Models", color=ACCENT_SOFT,
-                    width=_BTN_W, height=_BTN_H,
+                    width=group_a_w, height=_BTN_H, font=FONT_SMALL,
                     command=self._rescan_models).pack(side="left", padx=2)
         HoverButton(bar, t, text="Update Binaries", color=ACCENT_SOFT,
-                    width=_BTN_W, height=_BTN_H,
+                    width=group_a_w, height=_BTN_H, font=FONT_SMALL,
                     command=self._update_binaries).pack(side="left", padx=2)
 
-        # Quick-switch slot buttons for bookmarked llama-server.exe paths.
-        # Populated dynamically from self.cfg["server_slots"]. Rebuilt whenever
-        # the paths dialog is saved or a slot is clicked (for active highlight).
-        # Small left margin to separate visually from "Update Binaries".
+        # Group B: engine slot buttons (middle, dynamic).
+        # Sized and spacing handled in _refresh_slot_buttons. Extra left
+        # margin separates the slot group from Update Binaries.
         self._slot_bar = tk.Frame(bar, bg=t.bg)
-        self._slot_bar.pack(side="left", padx=(10, 0))
-        self._slot_buttons: list = []  # filled by _refresh_slot_buttons
+        self._slot_bar.pack(side="left", padx=(12, 0))
+        self._slot_buttons: list = []
 
-        # Right-aligned buttons: also wider on Linux for the same
-        # font-metrics reason as Rescan/Update above.
-        _SIDE_W = 80 if IS_WINDOWS else 100
-        _SAVE_W = 168 if IS_WINDOWS else 200
+        # Group C: settings (right, packed right-to-left so About lands
+        # at the far right). Save Results is standalone with its own width.
+        group_c_w = self._measure_label_group_width(
+            ["About", "Paths"], bold=False, h_pad=_H_PAD)
         HoverButton(bar, t, text="About", color=ACCENT_SOFT,
-                    width=_SIDE_W, height=_BTN_H,
+                    width=group_c_w, height=_BTN_H, font=FONT_SMALL,
                     command=self._show_about).pack(side="right", padx=2)
         HoverButton(bar, t, text="Paths", color=ACCENT_SOFT,
-                    width=_SIDE_W, height=_BTN_H,
+                    width=group_c_w, height=_BTN_H, font=FONT_SMALL,
                     command=self._show_paths_dialog).pack(side="right", padx=2)
 
+        save_w = self._measure_label_group_width(
+            ["💾  Save Results..."], bold=False, h_pad=_H_PAD)
         self._save_bench_btn = HoverButton(bar, t, text="💾  Save Results...",
-                                            color=t.border, width=_SAVE_W, height=_BTN_H,
+                                            color=t.border, width=save_w,
+                                            height=_BTN_H, font=FONT_SMALL,
                                             command=self._save_pending_bench)
         self._save_bench_btn.configure_btn(state="disabled")
         self._save_bench_btn.pack(side="right", padx=(2, 12))
@@ -4046,15 +4074,24 @@ class TurboQuantQLauncher(tk.Tk):
         active_norm = os.path.normcase(os.path.normpath(active_path)) if active_path else ""
 
         _BTN_H = 28
+        # v0.54: slot buttons share a uniform width computed from the
+        # widest slot label in the current config. Wider inter-button
+        # spacing (padx=6) makes the engine names breathe a bit.
+        slot_labels = []
+        for sp in slots:
+            if sp and sp.strip():
+                lbl = slot_label_from_path(sp)
+                if lbl:
+                    slot_labels.append(lbl)
+        btn_w = self._measure_label_group_width(
+            slot_labels, bold=False, h_pad=20) if slot_labels else 90
+
         for slot_path in slots:
             if not slot_path or not slot_path.strip():
                 continue
             label = slot_label_from_path(slot_path)
             if not label:
                 continue
-            # Width scales with label length. Base 20px padding + ~8px per char.
-            # Clamped to [90, 180] so very long names don't blow out the layout.
-            btn_w = max(90, min(180, len(label) * 8 + 20))
 
             # Highlight active slot
             slot_norm = os.path.normcase(os.path.normpath(slot_path))
@@ -4067,9 +4104,9 @@ class TurboQuantQLauncher(tk.Tk):
                 color = t.border  # muted/disabled look
 
             btn = HoverButton(self._slot_bar, t, text=label, color=color,
-                              width=btn_w, height=_BTN_H,
+                              width=btn_w, height=_BTN_H, font=FONT_SMALL,
                               command=lambda p=slot_path: self._on_slot_click(p))
-            btn.pack(side="left", padx=2)
+            btn.pack(side="left", padx=6)
             ToolTip(btn, slot_path, theme=t)
             self._slot_buttons.append(btn)
 
@@ -5057,6 +5094,56 @@ class TurboQuantQLauncher(tk.Tk):
             return
 
         cmd = [server_exe, "-m", model.path, "-ngl", "99"]
+
+        # ────────────────────────────────────────────────────────────────
+        # v0.54: Vision model support via mmproj auto-detection.
+        #
+        # Vision-Language models (Qwen3-VL, Llama-3.2-Vision, etc.) ship
+        # as TWO GGUF files: the main weights + a companion multi-modal
+        # projector file that encodes images into the model's embedding
+        # space. llama.cpp requires both to be passed explicitly:
+        #    llama-server -m model.gguf --mmproj mmproj-F16.gguf
+        #
+        # Rather than adding a UI field, we auto-detect mmproj siblings
+        # in the same directory as the selected model. Convention used by
+        # Unsloth, Bartowski, and the official Qwen repos: the projector
+        # filename starts with 'mmproj' (usually 'mmproj-F16.gguf' or
+        # 'mmproj-Q8_0.gguf'). Zero config for the user — drop the pair
+        # of files into a model directory and both flags are wired up.
+        #
+        # For text-only models (no mmproj present) this block is a no-op,
+        # so existing workflows (Qwen 3, Llama, Mistral, Gemma text) are
+        # unaffected. qnut Probe runs on text-only models also untouched.
+        # Cross-platform: works identically on Linux and Windows since
+        # llama.cpp uses the same --mmproj flag on both platforms.
+        # ────────────────────────────────────────────────────────────────
+        try:
+            model_dir = os.path.dirname(model.path)
+            mmproj_files = [
+                f for f in os.listdir(model_dir)
+                if f.lower().startswith("mmproj") and f.lower().endswith(".gguf")
+            ]
+            if mmproj_files:
+                # Prefer F16 projector over quantized variants when multiple
+                # exist side-by-side — F16 is the reference encoder quality
+                # and projector size is negligible (~600MB-1GB) compared to
+                # weight savings on the main model.
+                mmproj_files.sort(
+                    key=lambda f: (0 if "f16" in f.lower() else 1, f.lower())
+                )
+                mmproj_path = os.path.join(model_dir, mmproj_files[0])
+                cmd.extend(["--mmproj", mmproj_path])
+                self._log(
+                    f"  Vision encoder auto-attached: {mmproj_files[0]}",
+                    "info",
+                )
+        except OSError as e:
+            # Directory scan failed — log and continue without vision.
+            # The server will still start as text-only.
+            self._log(
+                f"  mmproj scan failed ({e}); starting text-only",
+                "warn",
+            )
 
         is_cpu = (gpu_key == "CPU")
         if is_cpu:

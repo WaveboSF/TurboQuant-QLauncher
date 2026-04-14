@@ -16,6 +16,7 @@ Features:
 - NVIDIA + AMD + Intel + Apple GPU detection
 - Quick-switch slot bookmarks for multiple llama-server.exe builds
 - Bench All matrix mode (KV × LA × Depth) with configurable timeout
+- Vision model support: auto-attaches mmproj-*.gguf next to VL models (v0.54)
 - Server log output with timestamps
 - Persistent JSON config
 
@@ -48,7 +49,7 @@ from tkinter import ttk, messagebox, filedialog
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.52"
+APP_VERSION = "0.54"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -600,7 +601,8 @@ def detect_all_gpus() -> List[GPUInfo]:
                         vram = int(parts[2]) // (1024 * 1024) if parts[2].isdigit() else 0
                     except (ValueError, IndexError):
                         vram = 0
-                    gpus.append(GPUInfo(index=idx, name=name, vendor=vendor, vram_mb=vram))
+                    cleaned = _clean_wmi_gpu_name(name)
+                    gpus.append(GPUInfo(index=idx, name=cleaned, vendor=vendor, vram_mb=vram))
                     idx += 1
     elif sys.platform == "linux":
         out = _run_cmd(["lspci"])
@@ -618,6 +620,58 @@ def detect_all_gpus() -> List[GPUInfo]:
                                         vendor="intel"))
                     idx += 1
     return gpus
+
+def _clean_wmi_gpu_name(raw: str) -> str:
+    """Turn WMI's verbose VideoController Name into something short and
+    readable for the model-card label column.
+
+    WMI Name field examples:
+      "NVIDIA GeForce RTX 5090"              -> "GeForce RTX 5090"
+      "AMD Radeon RX 7900 XTX"               -> "Radeon RX 7900 XTX"
+      "AMD Radeon(TM) Graphics"              -> "Radeon iGPU"       (APU)
+      "Intel(R) UHD Graphics 770"            -> "Intel UHD 770"     (iGPU)
+      "Intel(R) Iris(R) Xe Graphics"         -> "Intel Iris Xe"     (iGPU)
+      "Intel(R) Arc(TM) A770 Graphics"       -> "Intel Arc A770"    (discrete)
+    """
+    import re
+    s = raw
+    # Strip trademark marks
+    s = s.replace("(TM)", "").replace("(R)", "")
+    s = re.sub(r"[™®]", "", s)
+    # Collapse spaces
+    s = re.sub(r"\s+", " ", s).strip()
+    low = s.lower()
+
+    # AMD integrated (APU) — name is just "AMD Radeon Graphics" with no model
+    if "radeon graphics" in low and not any(
+            c.isdigit() for c in low.split("radeon")[-1].split("graphics")[0]):
+        return "Radeon iGPU"
+
+    # Intel iGPU family: UHD/HD/Iris Xe with integrated silicon
+    if "intel" in low:
+        # Strip "Intel " prefix, then re-prefix "Intel " for consistency
+        tail = re.sub(r"^Intel\s+", "", s, flags=re.IGNORECASE)
+        # Drop trailing "Graphics" — it's redundant with the category
+        tail = re.sub(r"\s+Graphics\s*$", "", tail, flags=re.IGNORECASE)
+        tail = tail.strip()
+        if tail:
+            return f"Intel {tail}"
+        return "Intel iGPU"
+
+    # AMD discrete (has a model number in the Radeon line)
+    if "amd" in low or "radeon" in low:
+        s = re.sub(r"^AMD\s+", "", s, flags=re.IGNORECASE)
+        return s.strip()
+
+    # NVIDIA — strip "NVIDIA " prefix, keep the rest
+    if "nvidia" in low or "geforce" in low:
+        s = re.sub(r"^NVIDIA\s+", "", s, flags=re.IGNORECASE)
+        return s.strip()
+
+    # Fallback — cap at 28 chars
+    if len(s) > 28:
+        s = s[:26] + "…"
+    return s or raw[:28]
 
 def detect_cpu_ram_gb() -> float:
     """Detect total system RAM in GB."""
@@ -773,6 +827,7 @@ _FILENAME_JUNK_HINTS = (
     "ggml-vocab-",   # vocabulary-only dumps from llama.cpp tests
     "-vocab.gguf",   # same pattern, alt naming
     ".tmp.gguf",     # partial downloads
+    "mmproj",        # v0.54: companion vision projector, auto-attached
 )
 
 def _is_junk_filename(fn: str) -> bool:
@@ -1417,6 +1472,26 @@ class TurboQuantQLauncher(tk.Tk):
     def _configure_theme(self):
         t = self.theme
         self.configure(bg=t.bg)
+
+        # HiDPI Tk scaling. Once DPI awareness is declared in main(),
+        # Windows no longer upscales us, which means widgets designed for
+        # 96 DPI appear tiny on a 4K monitor. Tk's own scaling factor
+        # compensates: it multiplies widget sizes without losing sharpness.
+        # Mirrors the Linux build's logic. Runs only on first theme-
+        # configure (not on live-swap rebuild) so repeated toggles don't
+        # compound.
+        if not getattr(self, "_tk_scaling_applied", False):
+            try:
+                sh = self.winfo_screenheight()
+                if sh >= 2000:      # 4K class
+                    self.tk.call("tk", "scaling", 2.0)
+                elif sh >= 1600:    # 2.5K / QHD class
+                    self.tk.call("tk", "scaling", 1.5)
+                # Otherwise leave default (FHD / 1080p).
+                self._tk_scaling_applied = True
+            except Exception:
+                pass
+
         s = ttk.Style(self)
         s.theme_use("clam")
         s.configure(".", background=t.bg, foreground=t.fg, fieldbackground=t.entry_bg,
@@ -3452,6 +3527,23 @@ class TurboQuantQLauncher(tk.Tk):
 
     # ─── Footer ───────────────────────────────────────────────────────────
 
+    def _measure_label_group_width(self, labels, bold: bool = False,
+                                   h_pad: int = 20) -> int:
+        """Uniform width for a group of button labels.
+
+        Sizes to the widest label in the group using tkfont.measure() so
+        the result honors Tk's current scaling factor. h_pad is the total
+        horizontal padding (split left+right inside the button canvas).
+        bold controls whether we measure against Consolas bold or regular
+        — must match the font actually passed to HoverButton.
+        """
+        import tkinter.font as tkfont
+        f = tkfont.Font(family=_MONO, size=10,
+                        weight="bold" if bold else "normal")
+        if not labels:
+            return 80
+        return max(f.measure(l) for l in labels) + h_pad
+
     def _build_footer(self):
         t = self.theme
         # side="bottom" anchors the footer to the window bottom edge
@@ -3462,31 +3554,47 @@ class TurboQuantQLauncher(tk.Tk):
         bar.pack(side="bottom", fill="x", padx=16, pady=(6, 8))
         tk.Frame(self, height=1, bg=t.border).pack(side="bottom", fill="x")
 
-        _BTN_W, _BTN_H = 130, 28
+        # v0.54: three independent button groups, each with its own uniform
+        # width sized to the widest label in that group. This keeps short
+        # labels ("About") from being stretched to match long ones
+        # ("Update Binaries"). FONT_SMALL (non-bold) gives a lighter,
+        # more filigree appearance than the previous FONT_SMALL_B.
+        _BTN_H = 28
+        _H_PAD = 20   # ~1 char padding each side at Consolas 10
+
+        # Group A: file-ops (left)
+        group_a_w = self._measure_label_group_width(
+            ["Rescan Models", "Update Binaries"], bold=False, h_pad=_H_PAD)
         HoverButton(bar, t, text="Rescan Models", color=ACCENT_SOFT,
-                    width=_BTN_W, height=_BTN_H,
+                    width=group_a_w, height=_BTN_H, font=FONT_SMALL,
                     command=self._rescan_models).pack(side="left", padx=2)
         HoverButton(bar, t, text="Update Binaries", color=ACCENT_SOFT,
-                    width=_BTN_W, height=_BTN_H,
+                    width=group_a_w, height=_BTN_H, font=FONT_SMALL,
                     command=self._update_binaries).pack(side="left", padx=2)
 
-        # Quick-switch slot buttons for bookmarked llama-server.exe paths.
-        # Populated dynamically from self.cfg["server_slots"]. Rebuilt whenever
-        # the paths dialog is saved or a slot is clicked (for active highlight).
-        # Small left margin to separate visually from "Update Binaries".
+        # Group B: engine slot buttons (middle, dynamic).
+        # Sized and spacing handled in _refresh_slot_buttons. Extra left
+        # margin separates the slot group from Update Binaries.
         self._slot_bar = tk.Frame(bar, bg=t.bg)
-        self._slot_bar.pack(side="left", padx=(10, 0))
-        self._slot_buttons: list = []  # filled by _refresh_slot_buttons
+        self._slot_bar.pack(side="left", padx=(12, 0))
+        self._slot_buttons: list = []
 
+        # Group C: settings (right, packed right-to-left so About lands
+        # at the far right). Save Results is standalone with its own width.
+        group_c_w = self._measure_label_group_width(
+            ["About", "Paths"], bold=False, h_pad=_H_PAD)
         HoverButton(bar, t, text="About", color=ACCENT_SOFT,
-                    width=80, height=_BTN_H,
+                    width=group_c_w, height=_BTN_H, font=FONT_SMALL,
                     command=self._show_about).pack(side="right", padx=2)
         HoverButton(bar, t, text="Paths", color=ACCENT_SOFT,
-                    width=80, height=_BTN_H,
+                    width=group_c_w, height=_BTN_H, font=FONT_SMALL,
                     command=self._show_paths_dialog).pack(side="right", padx=2)
 
+        save_w = self._measure_label_group_width(
+            ["💾  Save Results..."], bold=False, h_pad=_H_PAD)
         self._save_bench_btn = HoverButton(bar, t, text="💾  Save Results...",
-                                            color=t.border, width=168, height=_BTN_H,
+                                            color=t.border, width=save_w,
+                                            height=_BTN_H, font=FONT_SMALL,
                                             command=self._save_pending_bench)
         self._save_bench_btn.configure_btn(state="disabled")
         self._save_bench_btn.pack(side="right", padx=(2, 12))
@@ -3515,15 +3623,24 @@ class TurboQuantQLauncher(tk.Tk):
         active_norm = os.path.normcase(os.path.normpath(active_path)) if active_path else ""
 
         _BTN_H = 28
+        # v0.54: slot buttons share a uniform width computed from the
+        # widest slot label in the current config. Wider inter-button
+        # spacing (padx=6) makes the engine names breathe a bit.
+        slot_labels = []
+        for sp in slots:
+            if sp and sp.strip():
+                lbl = slot_label_from_path(sp)
+                if lbl:
+                    slot_labels.append(lbl)
+        btn_w = self._measure_label_group_width(
+            slot_labels, bold=False, h_pad=20) if slot_labels else 90
+
         for slot_path in slots:
             if not slot_path or not slot_path.strip():
                 continue
             label = slot_label_from_path(slot_path)
             if not label:
                 continue
-            # Width scales with label length. Base 20px padding + ~8px per char.
-            # Clamped to [90, 180] so very long names don't blow out the layout.
-            btn_w = max(90, min(180, len(label) * 8 + 20))
 
             # Highlight active slot
             slot_norm = os.path.normcase(os.path.normpath(slot_path))
@@ -3536,9 +3653,9 @@ class TurboQuantQLauncher(tk.Tk):
                 color = t.border  # muted/disabled look
 
             btn = HoverButton(self._slot_bar, t, text=label, color=color,
-                              width=btn_w, height=_BTN_H,
+                              width=btn_w, height=_BTN_H, font=FONT_SMALL,
                               command=lambda p=slot_path: self._on_slot_click(p))
-            btn.pack(side="left", padx=2)
+            btn.pack(side="left", padx=6)
             ToolTip(btn, slot_path, theme=t)
             self._slot_buttons.append(btn)
 
@@ -4527,6 +4644,54 @@ class TurboQuantQLauncher(tk.Tk):
 
         cmd = [server_exe, "-m", model.path, "-ngl", "99"]
 
+        # ────────────────────────────────────────────────────────────────
+        # v0.54: Vision model support via mmproj auto-detection.
+        #
+        # Vision-Language models (Qwen3-VL, Llama-3.2-Vision, etc.) ship
+        # as TWO GGUF files: the main weights + a companion multi-modal
+        # projector file that encodes images into the model's embedding
+        # space. llama.cpp requires both to be passed explicitly:
+        #    llama-server -m model.gguf --mmproj mmproj-F16.gguf
+        #
+        # Rather than adding a UI field, we auto-detect mmproj siblings
+        # in the same directory as the selected model. Convention used by
+        # Unsloth, Bartowski, and the official Qwen repos: the projector
+        # filename starts with 'mmproj' (usually 'mmproj-F16.gguf' or
+        # 'mmproj-Q8_0.gguf'). Zero config for the user — drop the pair
+        # of files into a model directory and both flags are wired up.
+        #
+        # For text-only models (no mmproj present) this block is a no-op,
+        # so existing workflows (Qwen 3, Llama, Mistral, Gemma text) are
+        # unaffected. qnut Probe runs on text-only models also untouched.
+        # ────────────────────────────────────────────────────────────────
+        try:
+            model_dir = os.path.dirname(model.path)
+            mmproj_files = [
+                f for f in os.listdir(model_dir)
+                if f.lower().startswith("mmproj") and f.lower().endswith(".gguf")
+            ]
+            if mmproj_files:
+                # Prefer F16 projector over quantized variants when multiple
+                # exist side-by-side — F16 is the reference encoder quality
+                # and projector size is negligible (~600MB-1GB) compared to
+                # weight savings on the main model.
+                mmproj_files.sort(
+                    key=lambda f: (0 if "f16" in f.lower() else 1, f.lower())
+                )
+                mmproj_path = os.path.join(model_dir, mmproj_files[0])
+                cmd.extend(["--mmproj", mmproj_path])
+                self._log(
+                    f"  Vision encoder auto-attached: {mmproj_files[0]}",
+                    "info",
+                )
+        except OSError as e:
+            # Directory scan failed — log and continue without vision.
+            # The server will still start as text-only.
+            self._log(
+                f"  mmproj scan failed ({e}); starting text-only",
+                "warn",
+            )
+
         is_cpu = (gpu_key == "CPU")
         if is_cpu:
             cmd[cmd.index("-ngl") + 1] = "0"
@@ -5255,6 +5420,25 @@ class TurboQuantQLauncher(tk.Tk):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # ─── DPI awareness (MUST run before any Tk window is created) ─────────
+    # Without this, Windows applies DWM bitmap scaling on HiDPI displays:
+    # Tk renders at 96 DPI into a small bitmap, Windows bilinearly upscales
+    # → blurry text ("unscharf"). Declaring System-DPI-Aware disables the
+    # bitmap upscale so text renders at native resolution. Per-Monitor-V2
+    # would be nicer but Tk doesn't handle WM_DPICHANGED, so staying at
+    # level 1 is the right trade-off.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            # Pre-Windows-8.1 or shcore missing — fall back to the legacy
+            # user32 API which exists since Vista.
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
     # Hide the console window on Windows when launched via py.exe / python.exe
     if sys.platform == "win32":
         try:
