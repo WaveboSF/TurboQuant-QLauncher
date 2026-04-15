@@ -49,7 +49,7 @@ from tkinter import ttk, messagebox, filedialog
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.54"
+APP_VERSION = "0.55"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -1450,10 +1450,38 @@ class TurboQuantQLauncher(tk.Tk):
         self._build_log_area()
         self._pending_bench = None  # (model, gpu_label, results, kv_name) — set after bench
 
-        w = self.cfg.get("window_w", 1000)
-        h = self.cfg.get("window_h", 800)
+        # v0.55: Adaptive default window size + minimal min_size.
+        #
+        # Problem: 1000x800 default + 860x600 min_size + Tk scaling 1.5x
+        # on HiDPI = effective 1500x1200 / 1290x900. On a 1366x768 laptop
+        # or any 1080p screen with taskbar, the window doesn't fit.
+        #
+        # Fix: cap the default to what actually fits on this screen
+        # (minus a small margin for taskbar/titlebar), and lower the
+        # min_size so the user can mouse-drag the window to any size
+        # they want without bumping into a hard floor.
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        # Tk scaling factor — 1.0 on FHD, 1.5 / 2.0 on QHD / 4K. Default
+        # window dimensions are pre-scaling pixel values, so we have to
+        # divide the available screen area by it before clamping.
+        try:
+            tk_scale = float(self.tk.call("tk", "scaling")) / (96.0 / 72.0)
+        except Exception:
+            tk_scale = 1.0
+        # 60 px margin reserves room for taskbar (Windows ~40-50 px) +
+        # window decorations. Better to undershoot than to overshoot.
+        max_w = int((screen_w - 60) / tk_scale)
+        max_h = int((screen_h - 100) / tk_scale)
+
+        w = min(self.cfg.get("window_w", 1000), max_w)
+        h = min(self.cfg.get("window_h", 800), max_h)
         self.geometry(f"{w}x{h}")
-        self.minsize(860, 600)
+        # Aggressive min_size: 600x400 lets the user shrink the window
+        # to almost any size. Content remains accessible because the
+        # settings bar is now horizontally scrollable (see
+        # _build_settings_bar) and the model list / log already scroll.
+        self.minsize(600, 400)
         if self.cfg.get("window_x") is not None:
             self.geometry(f"+{self.cfg['window_x']}+{self.cfg['window_y']}")
         else:
@@ -1796,6 +1824,28 @@ class TurboQuantQLauncher(tk.Tk):
 
     # ─── Settings Bar ─────────────────────────────────────────────────────
 
+    def _make_hbar_autohide(self, hbar):
+        """Wrap a scrollbar's set() call so it hides when content fits.
+
+        Returns a callable suitable for the xscrollcommand option of a
+        Canvas. When the visible range covers the full content (lo==0,
+        hi==1), the scrollbar pack-forgets itself; otherwise it
+        re-packs at the bottom of its parent. This avoids reserving
+        space for an inactive scrollbar.
+        """
+        def _set(lo, hi):
+            try:
+                lo_f, hi_f = float(lo), float(hi)
+                if lo_f <= 0.0 and hi_f >= 1.0:
+                    hbar.pack_forget()
+                else:
+                    if not hbar.winfo_ismapped():
+                        hbar.pack(side="bottom", fill="x")
+                hbar.set(lo, hi)
+            except (ValueError, tk.TclError):
+                pass
+        return _set
+
     def _build_settings_bar(self):
         t = self.theme
         self._sel_model = -1
@@ -1811,8 +1861,45 @@ class TurboQuantQLauncher(tk.Tk):
         self._running_kv: Optional[str] = None
         self._running_la: Optional[int] = None
 
-        row = tk.Frame(self, bg=t.bg)
-        row.pack(fill="x", padx=16, pady=(8, 4))
+        # v0.55: settings bar lives inside a horizontally scrollable canvas.
+        # On narrow windows the KV / LA / Probe / Port / Ctx / Timeout /
+        # Run / Stop row used to clip — controls on the right disappeared
+        # with no way to reach them. Now a horizontal scrollbar appears
+        # on demand (only when content exceeds canvas width).
+        bar_outer = tk.Frame(self, bg=t.bg)
+        bar_outer.pack(fill="x", padx=16, pady=(8, 0))
+
+        bar_canvas = tk.Canvas(bar_outer, bg=t.bg, highlightthickness=0,
+                               height=32, bd=0)
+        bar_hbar = ttk.Scrollbar(bar_outer, orient="horizontal",
+                                  command=bar_canvas.xview)
+        bar_canvas.configure(xscrollcommand=self._make_hbar_autohide(bar_hbar))
+        bar_canvas.pack(side="top", fill="x", expand=True)
+        # Scrollbar is packed but auto-hides via _make_hbar_autohide when
+        # content fits. We pack it in a separate slot so the canvas height
+        # doesn't jump when the bar appears/disappears.
+        bar_hbar.pack(side="bottom", fill="x")
+
+        row = tk.Frame(bar_canvas, bg=t.bg)
+        bar_canvas.create_window((0, 0), window=row, anchor="nw")
+
+        # Update scrollregion when content size changes (e.g. theme rebuild,
+        # font reflow). Also resize the canvas height to match the row's
+        # natural height so we don't cut off button visuals.
+        def _on_row_configure(event):
+            bar_canvas.configure(scrollregion=bar_canvas.bbox("all"))
+            bar_canvas.configure(height=event.height)
+        row.bind("<Configure>", _on_row_configure)
+
+        # Mouse-wheel: shift+wheel scrolls horizontally when cursor is
+        # over the bar. Plain wheel is left alone for the model list.
+        def _on_shift_wheel(event):
+            if sys.platform == "darwin":
+                bar_canvas.xview_scroll(-event.delta, "units")
+            else:
+                bar_canvas.xview_scroll(int(-event.delta / 120) * 3, "units")
+        bar_canvas.bind("<Shift-MouseWheel>", _on_shift_wheel)
+        row.bind("<Shift-MouseWheel>", _on_shift_wheel)
 
         kv_label = tk.Label(row, text="KV:", font=FONT_BODY_B, bg=t.bg, fg=t.fg)
         kv_label.pack(side="left")
@@ -5067,13 +5154,13 @@ class TurboQuantQLauncher(tk.Tk):
                  bg=t.bg, fg=t.fg).pack(padx=20, pady=(12, 8), anchor="w")
         tk.Frame(dlg, height=1, bg=t.border).pack(fill="x", padx=16, pady=(0, 8))
 
-        tk.Label(dlg, text=f"LLM Models Directories (up to {MAX_MODELS_PATHS}):",
+        tk.Label(dlg, text="LLM Models Directories:",
                  font=FONT_BODY_B, bg=t.bg, fg=t.fg).pack(padx=20, anchor="w")
         tk.Label(dlg,
                  text="All configured directories are scanned together. "
                       "Duplicate files are detected automatically.",
                  font=FONT_BODY, bg=t.bg, fg=t.fg_dim,
-                 wraplength=680, justify="left").pack(padx=20, anchor="w", pady=(0, 4))
+                 wraplength=964, justify="left").pack(padx=20, anchor="w", pady=(0, 4))
 
         # Load current model paths, pad to MAX_MODELS_PATHS
         current_models_paths = list(self.cfg.get("llm_models_paths") or [])
@@ -5105,25 +5192,16 @@ class TurboQuantQLauncher(tk.Tk):
                                  activebackground=t.bg, activeforeground=t.fg)
         cb_rec.pack(side="left")
 
-        tk.Label(dlg, text="llama-server.exe Path (active):", font=FONT_BODY_B,
-                 bg=t.bg, fg=t.fg).pack(padx=20, anchor="w")
-        server_frame = tk.Frame(dlg, bg=t.bg)
-        server_frame.pack(fill="x", padx=20, pady=(2, 8))
-        server_var = tk.StringVar(value=self.cfg.get("llama_server_path", ""))
-        server_entry = ttk.Entry(server_frame, textvariable=server_var, font=FONT_BODY)
-        server_entry.pack(side="left", fill="x", expand=True)
-        HoverButton(server_frame, t, text="...", color=t.border, width=36, height=24,
-                    command=lambda: self._browse_file(server_var)).pack(side="left", padx=(4, 0))
-
         # ── Quick-switch slots ──
         tk.Frame(dlg, height=1, bg=t.border).pack(fill="x", padx=16, pady=(4, 8))
-        tk.Label(dlg, text=f"Quick-Switch Slots (up to {MAX_SERVER_SLOTS}):",
+        tk.Label(dlg, text="Quick-Switch Slots:",
                  font=FONT_BODY_B, bg=t.bg, fg=t.fg).pack(padx=20, anchor="w")
         tk.Label(dlg,
-                 text="Bookmark additional llama-server.exe builds here — "
-                      "they appear as one-click buttons in the footer.",
+                 text="Bookmark llama-server.exe builds here — they appear "
+                      "as one-click buttons in the footer. Click a button to "
+                      "activate that engine.",
                  font=FONT_BODY, bg=t.bg, fg=t.fg_dim,
-                 wraplength=680, justify="left").pack(padx=20, anchor="w", pady=(0, 4))
+                 wraplength=964, justify="left").pack(padx=20, anchor="w", pady=(0, 4))
 
         # Load current slots, pad to MAX_SERVER_SLOTS
         current_slots = list(self.cfg.get("server_slots") or [])
@@ -5177,9 +5255,26 @@ class TurboQuantQLauncher(tk.Tk):
             self.cfg["llm_models_recursive"] = bool(recursive_var.get())
             # Drop the legacy single-path key if it's still hanging around
             self.cfg.pop("llm_models_path", None)
-            self.cfg["llama_server_path"] = server_var.get()
             # persist slot paths (strip whitespace, keep empty slots)
-            self.cfg["server_slots"] = [v.get().strip() for v in slot_vars]
+            new_slots = [v.get().strip() for v in slot_vars]
+            self.cfg["server_slots"] = new_slots
+
+            # v0.55: active llama_server_path is set EXCLUSIVELY by
+            # _on_slot_click() in the main UI; this dialog never writes
+            # to it. If the user removes the slot whose path is currently
+            # active, log a hint — the engine still works, just no slot
+            # button will be highlighted until they click one.
+            current_active = (self.cfg.get("llama_server_path") or "").strip()
+            if current_active:
+                slot_norms = {os.path.normcase(os.path.normpath(s))
+                              for s in new_slots if s}
+                active_norm = os.path.normcase(os.path.normpath(current_active))
+                if active_norm not in slot_norms:
+                    self._log(
+                        "Note: active engine is no longer bookmarked in any "
+                        "slot. It still works, but no slot button will be "
+                        "highlighted until you click one.", "info")
+
             save_config(self.cfg)
             self._log("Paths saved.", "good")
             dlg.destroy()
@@ -5199,7 +5294,7 @@ class TurboQuantQLauncher(tk.Tk):
                     width=100, height=28, command=_cancel).pack(side="left", padx=8)
 
         dlg.update_idletasks()
-        self._center_window(dlg, 720, dlg.winfo_reqheight())
+        self._center_window(dlg, 1024, dlg.winfo_reqheight())
 
     def _browse_dir(self, var: tk.StringVar):
         path = filedialog.askdirectory(initialdir=var.get())
