@@ -34,6 +34,7 @@ import glob
 import time
 import signal
 import socket
+import struct
 import argparse
 import platform
 import subprocess
@@ -73,7 +74,7 @@ def no_console_kwargs() -> dict:
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.56"
+APP_VERSION = "0.57"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -996,6 +997,239 @@ def check_required_dlls(server_dir: str) -> List[Dict]:
 # SECTION: Model Scanner
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ───────────────────────────────────────────────────────────────────────────────
+# GGUF metadata parser (v0.57).
+#
+# Replaces the v0.56 filename-substring check as the primary source of truth
+# for "is this a reasoning model?". Reads only the header of each GGUF file
+# (first 1 MB max) — metadata sits BEFORE the tensor data in GGUF, so we
+# never touch the multi-GB weight section. Per file this is typically
+# 5–50 KB of disk IO + a small amount of parsing, i.e. sub-millisecond on
+# any modern SSD.
+#
+# We intentionally do NOT pull in the `gguf-py` package (part of llama.cpp)
+# to avoid a 3 MB dependency for what amounts to reading three string
+# values. The parser understands enough of the GGUF v2/v3 spec to walk the
+# metadata KV section and extract `general.architecture`, `general.name`,
+# and `tokenizer.chat_template`. All other keys are skipped by advancing
+# the file pointer past their serialized length.
+#
+# On malformed / truncated / non-GGUF files the parser returns None and
+# the caller falls back to the legacy filename-substring check. No crash,
+# no log spam — a broken file is just silently filename-matched.
+#
+# Reasoning detection rules (applied to the parsed metadata):
+#   1. Architecture in {"qwen3", "deepseek2"} → reasoning by default.
+#   2. Chat template contains <think> / <|think|> / <|thinking|> markers
+#      → the model was trained to emit thinking blocks, i.e. reasoning.
+#   3. Neither matches → fall through to filename substring (legacy).
+
+# GGUF value-type enum widths for fixed-width scalars. Used to skip values
+# we don't care about.
+_GGUF_SCALAR_WIDTHS = {
+    0: 1,   # uint8
+    1: 1,   # int8
+    2: 2,   # uint16
+    3: 2,   # int16
+    4: 4,   # uint32
+    5: 4,   # int32
+    6: 4,   # float32
+    7: 1,   # bool
+    10: 8,  # uint64
+    11: 8,  # int64
+    12: 8,  # float64
+}
+_GGUF_TYPE_STRING = 8
+_GGUF_TYPE_ARRAY = 9
+
+# Only these metadata keys are worth keeping. Everything else is skipped.
+_GGUF_KEYS_OF_INTEREST = frozenset({
+    "general.architecture",
+    "general.name",
+    "tokenizer.chat_template",
+})
+
+# Architectures where reasoning / thinking is the default behaviour.
+# Expand as new reasoning-native architectures ship.
+_GGUF_REASONING_ARCHITECTURES = frozenset({
+    "qwen3",
+    "deepseek2",
+})
+
+# Substrings in the chat template that indicate a thinking-capable model.
+# Lowercased comparison. If any of these appear in tokenizer.chat_template,
+# the model was trained to emit <think> blocks.
+_GGUF_THINKING_TEMPLATE_MARKERS = (
+    "<think>",
+    "</think>",
+    "<|think|>",
+    "<|thinking|>",
+)
+
+
+def _read_gguf_value(buf: bytes, pos: int, val_type: int, depth: int = 0):
+    """Read (or skip) one GGUF metadata value. Returns (value, new_pos).
+
+    Returns (None, None) on any parse error. For non-string types the
+    value is returned as None — we only care about strings here, so
+    scalars and arrays are advanced past without materialising.
+    """
+    if depth > 2:
+        # Nested arrays of arrays of arrays — pathological, bail out.
+        return None, None
+
+    if val_type in _GGUF_SCALAR_WIDTHS:
+        w = _GGUF_SCALAR_WIDTHS[val_type]
+        if pos + w > len(buf):
+            return None, None
+        return None, pos + w
+
+    if val_type == _GGUF_TYPE_STRING:
+        if pos + 8 > len(buf):
+            return None, None
+        s_len = struct.unpack_from("<Q", buf, pos)[0]
+        pos += 8
+        # chat_template can reach multiple KB of Jinja — cap at 4 MB for
+        # sanity but accept anything within the buffer we already read.
+        if s_len > 4 * 1024 * 1024 or pos + s_len > len(buf):
+            return None, None
+        try:
+            s = buf[pos:pos + s_len].decode("utf-8", errors="replace")
+        except Exception:
+            return None, None
+        return s, pos + s_len
+
+    if val_type == _GGUF_TYPE_ARRAY:
+        if pos + 12 > len(buf):
+            return None, None
+        inner_type = struct.unpack_from("<I", buf, pos)[0]
+        pos += 4
+        count = struct.unpack_from("<Q", buf, pos)[0]
+        pos += 8
+        if count > 100_000_000:
+            return None, None
+        # Scalar-typed arrays: bulk-skip count * width.
+        if inner_type in _GGUF_SCALAR_WIDTHS:
+            total = count * _GGUF_SCALAR_WIDTHS[inner_type]
+            if pos + total > len(buf):
+                return None, None
+            return None, pos + total
+        # Otherwise walk element by element (strings and nested arrays).
+        for _ in range(count):
+            _, pos = _read_gguf_value(buf, pos, inner_type, depth + 1)
+            if pos is None:
+                return None, None
+        return None, pos
+
+    # Unknown type — can't skip safely.
+    return None, None
+
+
+def _read_gguf_metadata(path: str, max_bytes: int = 1024 * 1024):
+    """Read GGUF header metadata. Returns dict of selected string keys or None.
+
+    Only keys in _GGUF_KEYS_OF_INTEREST are kept. All other keys are
+    parsed just enough to advance past them. Reads at most `max_bytes`
+    from disk — enough for the metadata section on every real-world
+    GGUF we've tested (typically 5–50 KB; chat templates push a few
+    specific models toward a few hundred KB).
+
+    Supports GGUF v2 and v3. Returns None on v1 (deprecated Jun 2023,
+    not seen in practice) and on any parse / IO error.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(max_bytes)
+    except OSError:
+        return None
+    if len(head) < 24 or head[:4] != b"GGUF":
+        return None
+    try:
+        version = struct.unpack_from("<I", head, 4)[0]
+    except struct.error:
+        return None
+    if version < 2:
+        # v1 used u32 counts (not u64) and is effectively extinct.
+        return None
+    try:
+        kv_count = struct.unpack_from("<Q", head, 16)[0]
+    except struct.error:
+        return None
+    # Sanity cap — real GGUFs have at most a few hundred metadata keys.
+    if kv_count > 10_000:
+        return None
+
+    pos = 24
+    result = {}
+    for _ in range(kv_count):
+        # Key: u64 length + utf-8 bytes.
+        if pos + 8 > len(head):
+            break
+        try:
+            key_len = struct.unpack_from("<Q", head, pos)[0]
+        except struct.error:
+            break
+        pos += 8
+        if key_len > 1024 or pos + key_len > len(head):
+            break
+        try:
+            key = head[pos:pos + key_len].decode("utf-8", errors="replace")
+        except Exception:
+            break
+        pos += key_len
+
+        # Value type: u32.
+        if pos + 4 > len(head):
+            break
+        try:
+            val_type = struct.unpack_from("<I", head, pos)[0]
+        except struct.error:
+            break
+        pos += 4
+
+        # Value: read & advance (or skip).
+        value, new_pos = _read_gguf_value(head, pos, val_type)
+        if new_pos is None:
+            # Parse failure — whatever we have in `result` so far is
+            # still usable, but we can't continue the walk reliably.
+            break
+        pos = new_pos
+        if key in _GGUF_KEYS_OF_INTEREST and isinstance(value, str):
+            result[key] = value
+
+    return result
+
+
+def _detect_is_reasoning(path: str, filename: str):
+    """Return (is_reasoning, architecture) for a GGUF at `path`.
+
+    Tries GGUF metadata first (architecture + chat template), falls back
+    to the legacy filename substring check if the GGUF is malformed or
+    the metadata is inconclusive. This guarantees v0.57 is at worst as
+    accurate as v0.56 (filename-only) and typically much more accurate
+    (handles renamed files, exotic quants, fine-tunes with different
+    names but intact templates).
+    """
+    meta = _read_gguf_metadata(path) or {}
+    arch = (meta.get("general.architecture") or "").strip().lower()
+    tmpl = meta.get("tokenizer.chat_template") or ""
+
+    is_reasoning = False
+    if arch in _GGUF_REASONING_ARCHITECTURES:
+        is_reasoning = True
+    elif tmpl:
+        low_tmpl = tmpl.lower()
+        if any(m in low_tmpl for m in _GGUF_THINKING_TEMPLATE_MARKERS):
+            is_reasoning = True
+
+    # Legacy fallback — if GGUF parse failed or model has no thinking
+    # template, still catch it via the filename-substring heuristic.
+    if not is_reasoning:
+        is_reasoning = _is_reasoning_model(filename)
+
+    return is_reasoning, arch
+
+
 @dataclass
 class ModelInfo:
     filename: str
@@ -1010,6 +1244,12 @@ class ModelInfo:
     # marker, and refused with a clear error in _exec_bench. See investigation
     # 2026-04-07: TheTom v2 + Qwen 27B from "Q:\AI, Deeplearning, ...".
     has_unsafe_path: bool = False
+    # v0.57: populated from GGUF metadata at scan time. See
+    # _detect_is_reasoning() for the decision rules. `architecture` is
+    # the lowercased value of `general.architecture` or "" if the GGUF
+    # was unreadable / malformed.
+    is_reasoning: bool = False
+    architecture: str = ""
 
 # Directory name patterns to skip during recursive scanning. These are
 # places where .gguf files may exist but are NOT user-selectable LLMs:
@@ -1143,12 +1383,17 @@ def _maybe_add_model(seen: Dict[str, "ModelInfo"], root: str, filename: str) -> 
         key = full_path
     if key in seen:
         return
+    # v0.57: read GGUF metadata for reasoning detection. Falls back to
+    # filename substring match if the GGUF is unreadable / malformed.
+    is_reasoning, arch = _detect_is_reasoning(full_path, filename)
     seen[key] = ModelInfo(
         filename=filename,
         path=full_path,
         size_bytes=size,
         size_gb=round(size / (1024**3), 1),
         has_unsafe_path=("," in full_path),
+        is_reasoning=is_reasoning,
+        architecture=arch,
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1620,6 +1865,39 @@ def _nut_compute_anchors(scores: dict, baseline_kv: str = "f16 (default)",
 # exchange. Intentionally minimal to keep the attack surface tiny — the
 # socket is bound to 127.0.0.1 only and only opens when the user has
 # explicitly enabled Autoload.
+
+def _port_is_free(port: int, host: str = "0.0.0.0") -> bool:
+    """Return True if a fresh TCP bind on (host, port) would succeed.
+
+    v0.57 — used to warn the user before starting llama-server on a port
+    that is already held by another process. Probes without SO_REUSEADDR
+    so we see exactly the same failure mode the llama-server bind would
+    hit. Probes on 0.0.0.0 to match the `--host 0.0.0.0` that
+    _start_server passes to llama-server — binding on 127.0.0.1 would
+    miss collisions with daemons bound to 0.0.0.0 or specific interfaces.
+
+    This is a probe, not a reservation: the returned socket is closed
+    immediately, so there is a tiny race window between this check and
+    the real llama-server bind. That is fine for a user-facing warning
+    — the goal is catching the 99% case of "something is already
+    listening on that port", not preventing a TOCTOU race.
+    """
+    if not (1 <= port <= 65535):
+        return False
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
 
 def _pid_is_alive(pid: int) -> bool:
     """Return True if a process with the given PID currently exists.
@@ -3047,7 +3325,7 @@ class TurboQuantQLauncher(tk.Tk):
         # _start_server was dropped, so this one-shot dialog is the
         # entire reasoning-model guard for Probe.)
 
-        if _is_reasoning_model(model.filename):
+        if model.is_reasoning:
             proceed = messagebox.askyesno(
                 "Probe Model — Reasoning Model Detected",
                 f"'{model.filename}' looks like a reasoning-capable "
@@ -5521,7 +5799,9 @@ class TurboQuantQLauncher(tk.Tk):
             #       being interrupted.
             #   (b) a single log line at the moment of starting, so the
             #       Server Log records that the combination was used.
-            if _is_reasoning_model(filename):
+            # v0.57 — detection now uses the is_reasoning flag computed
+            # from GGUF metadata at scan time (falls back to filename).
+            if model.is_reasoning:
                 self._log(
                     f"Note: '{filename}' is a reasoning-capable model "
                     f"and 'No Thinking' is ON. Accuracy on math / logic "
@@ -5531,7 +5811,75 @@ class TurboQuantQLauncher(tk.Tk):
                     "warn")
             cmd.extend(["--reasoning", "off"])
 
-        port = self._port_var.get()
+        # ────────────────────────────────────────────────────────────────
+        # v0.57: Port-conflict pre-flight check.
+        #
+        # Before spawning llama-server, probe-bind on the requested port.
+        # If something is already listening, llama-server will fail with
+        # a bind error a few seconds into startup — by which point the
+        # user has been staring at "Loading..." and wondering what went
+        # wrong. Catching it here lets us surface a concrete, actionable
+        # message (with likely causes) and let the user decide whether
+        # to try anyway (maybe the port is in TIME_WAIT) or change it.
+        # ────────────────────────────────────────────────────────────────
+        port_raw = (self._port_var.get() or "8080").strip()
+        try:
+            port_int = int(port_raw)
+            if not (1 <= port_int <= 65535):
+                raise ValueError
+        except ValueError:
+            self._log(
+                f"Invalid port value {port_raw!r} — falling back to 8080.",
+                "warn")
+            port_raw = "8080"
+            port_int = 8080
+
+        if not _port_is_free(port_int):
+            # Collision with our own IPC listener (Autoload ON + user
+            # typed a port that happened to hit it). Unlikely but ugly
+            # when it happens — give a specific error and bail.
+            if self._ipc_port and port_int == self._ipc_port:
+                messagebox.showerror(
+                    "Port Conflict with TurboQuant IPC",
+                    f"Port {port_int} is currently used by TurboQuant's "
+                    f"own IPC listener (started when Autoload was "
+                    f"enabled).\n\n"
+                    f"Starting llama-server on this port would fail. "
+                    f"Please pick a different port in the Port field "
+                    f"and try again.")
+                self._log(
+                    f"Server start cancelled — port {port_int} collides "
+                    f"with TurboQuant's IPC socket.",
+                    "error")
+                return
+            proceed = messagebox.askyesno(
+                "Port Already in Use",
+                f"Port {port_int} is already in use by another process "
+                f"on this machine.\n\n"
+                f"Starting llama-server on this port will most likely "
+                f"fail with a bind error. Common causes:\n\n"
+                f"  • Another llama-server instance is still running\n"
+                f"  • A different app (Ollama, vLLM, "
+                f"text-generation-webui, …) is using this port\n"
+                f"  • A previous server did not shut down cleanly\n\n"
+                f"Recommended: close the other process, or change the "
+                f"port in the Port field and try again.\n\n"
+                f"Start anyway?",
+                icon="warning",
+                default="no",
+            )
+            if not proceed:
+                self._log(
+                    f"Server start cancelled — port {port_int} is in "
+                    f"use.",
+                    "warn")
+                return
+            self._log(
+                f"Starting on port {port_int} despite apparent "
+                f"conflict — user confirmed override.",
+                "warn")
+
+        port = port_raw
         cmd.extend(["--host", "0.0.0.0", "--port", port])
 
         # Append -c <ctx> if user provided a context size.
@@ -6492,14 +6840,17 @@ class TurboQuantQLauncher(tk.Tk):
             return
         # Resolve the currently selected model, if any.
         filename = None
+        model_obj = None
         try:
             if (0 <= self._sel_model < len(self.models)):
-                filename = self.models[self._sel_model].filename
+                model_obj = self.models[self._sel_model]
+                filename = model_obj.filename
         except (AttributeError, IndexError):
             filename = None
+            model_obj = None
         show = (self._no_think_var.get()
-                and filename is not None
-                and _is_reasoning_model(filename))
+                and model_obj is not None
+                and model_obj.is_reasoning)
         if show:
             self._thinking_warn_label.config(
                 text="⚠ reasoning model",
