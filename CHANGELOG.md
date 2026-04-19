@@ -8,84 +8,51 @@ License: MIT · © WaveboSF 2026
 
 ---
 
-## v0.56
+## v0.58
+
+### Fixed
+- **Autoload selection-rectangle race.** When Autoload restored the last-
+  used (model, GPU) pair on startup, the running-indicator dot correctly
+  showed the autoloaded cell, but the selection rectangle ended up stuck
+  on cell (0, 0). Root cause: the default `_select_cell(0, 0)` queued
+  via `after_idle` at the end of card construction fired *after* the
+  synchronous autoload `_select_cell(target)` call, clobbering it. Fix
+  reroutes `_trigger_autoload_if_eligible()` through `after_idle`, so
+  both calls serialise into the same queue and the autoload selection
+  wins in the correct order.
 
 ### Added
-- **Autoload toggle** (footer button). Single master switch for
-  automatic model loading + CLI remote control. Three visual states,
-  all rendered with the constant label "Autoload" so the button width
-  never jitters:
-  - 🔒 locked (grey, disabled) — before the installation is verified.
-  - OFF — unlocked but opted out.
-  - ✓ ON (green) — next launcher start auto-loads the last-used
-    `(model, GPU)` pair, and CLI remote control is live.
-- **CLI remote control** for external tools (e.g. MyIDE-style
-  integration), available only when Autoload is ON:
-  - `--autostart` / `-a` — start the last-used model immediately.
-    Forwards via IPC to an already-running instance instead of opening
-    a second window.
-  - `--shutdown` / `-q` — close a running instance cleanly (no dialog,
-    no confirmation). Idempotent: exits `0` even when nothing is running.
-  - `--status` — print a JSON status report from the running instance.
-  - `--no-autostart` — force-skip autoload even if the toggle is ON.
-  - `--version`.
-- **Local IPC listener** on `127.0.0.1:<random free port>` when
-  Autoload is ON. Lock file `TurboQuant_QLauncher.lock` (JSON: `pid`,
-  `port`, `started`, `version`) lives next to the config. Protocol is
-  three line-based commands: `SHUTDOWN`, `AUTOSTART [model [gpu]]`,
-  `STATUS`.
-- **Single-instance forwarding**. A second `--autostart` call while
-  the launcher is already running sends the command over IPC and exits
-  instead of opening a second window.
-- **Inline "reasoning model" warning** next to the No Thinking
-  checkbox. A yellow `⚠ reasoning model` label appears whenever No
-  Thinking is checked AND the selected model is reasoning-capable
-  (Gemma 4 / Qwen3 / DeepSeek-R1 / QwQ). Tooltip carries the full
-  accuracy-drop explanation. Updates on checkbox toggle and on
-  model-row selection changes.
-
-### Changed
-- Server-output parser flips `cfg["install_verified"]` to `True` on
-  the first `listening` line. One-way gate that unlocks the Autoload
-  button.
-- `_start_server` records the `(model, GPU)` pair as `cfg["last_model"]`
-  / `cfg["last_gpu_key"]` right after `Popen()` succeeds, so autoload
-  has a target even if the user kills the launcher mid-load.
-- `_on_close` tears down the IPC listener before destroying the Tk
-  root, so in-flight `AUTOSTART` calls can't schedule main-thread work
-  on a dying interpreter.
-
-### Removed
-- **Blocking "Reasoning Model — Thinking disabled" messagebox** in
-  `_start_server`. It popped up before every single server start of a
-  reasoning model with No Thinking on — tedious when switching models
-  back-to-back. Replaced by the inline warning label next to the
-  checkbox plus a single log-line note at server start. The Probe
-  run's own one-shot reasoning-model dialog is unaffected (it still
-  fires before each Probe run since it describes a different, Probe-
-  specific trade-off).
-
-### Migration
-- The intermediate two-gate design (a "Safe Settings" footer button +
-  a separate "Autoload" checkbox in the settings bar) was merged into
-  a single footer toggle. Configs that had `safe_settings=True` are
-  auto-migrated to `autoload=True` on first load; the legacy key is
-  dropped.
-- Forward-compatible with v0.55: four new keys (`install_verified`,
-  `autoload`, `last_model`, `last_gpu_key`) default to `False` / `""`,
-  so an upgraded config behaves identically until the user opts in.
-- v0.55 can still read v0.56 configs (unknown keys are preserved).
+- **User-controlled font zoom.** Global Ctrl+Plus / Ctrl+Minus / Ctrl+0
+  keyboard shortcuts scale every font in the UI up or down by 10 %
+  steps, clamped to [0.75, 2.0]. Both main-row and numpad `+`/`-` keys
+  bound, plus `=` for US/DE layouts where Ctrl+= is what you actually
+  press for Ctrl+Plus. Applied on top of (not in place of) the existing
+  HiDPI Tk scaling, so 4K setups keep their automatic 2.0× factor.
+  Takes effect live via the same theme-rebuild mechanism used for
+  dark/light swap — no restart required. Persisted in `cfg["font_scale"]`.
+- **New config key `font_scale`** (float, default `1.0`, range
+  `[0.75, 2.0]`). Garbage values fall back to 1.0 without crashing.
 
 ### Internal
-- New imports: `socket`, `argparse`. New constant: `LOCK_FILE`.
-- New helpers: `_pid_is_alive`, `read_lock_file`, `send_ipc_command`.
-- New `TurboQuantQLauncher.__init__` parameter: `autostart_override`
-  (tri-state: `None` / `True` / `False`).
-- Stale lock files (dead PID, corrupt JSON) are purged silently on
-  next start.
-- Removed dead attribute `_probe_thinking_warning_acknowledged` — was
-  only needed as a bypass for the now-removed per-tuple reasoning-model
-  messagebox.
+- New constants `FONT_SCALE_MIN = 0.75`, `FONT_SCALE_MAX = 2.00`,
+  `FONT_SCALE_STEP = 0.10` alongside the existing `FONT_*` tuples.
+- New dict `_FONT_BASE` holding the unscaled base point sizes
+  (TITLE=15, SUBTITLE=12, HEADER=11, BODY=11, SMALL=10, DIM=10,
+  BRAILLE=12). The module-level `FONT_*` tuples are now derived from
+  these by `apply_font_scale()`.
+- New function `apply_font_scale(scale: float) -> float` rewrites the
+  `FONT_*` module globals in place. 6 pt floor per integer rounding
+  step guarantees fonts stay renderable at the minimum zoom level.
+  Returns the clamped scale so callers can persist the applied value.
+- New method `_on_font_zoom(delta: float)` drives live zoom. Same
+  save-rebuild-restore pattern as `_on_toggle_theme`, including the
+  Probe / Bench All mid-operation guard.
+- Linux-only: `_refresh_fonts(root)` (post-Tk-root font-family upgrade)
+  now delegates tuple construction to `apply_font_scale(_FONT_SCALE_CURRENT)`
+  so a family upgrade (DejaVu → JetBrains Mono / Fira Code) preserves
+  the current user zoom instead of silently resetting sizes to the
+  base values. New module-level `_FONT_SCALE_CURRENT` tracks the active
+  scale so `_refresh_fonts()` doesn't need launcher-instance access.
 
 ---
 

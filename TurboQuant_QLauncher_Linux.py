@@ -74,7 +74,7 @@ def no_console_kwargs() -> dict:
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.57"
+APP_VERSION = "0.58"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -330,6 +330,14 @@ DEFAULT_CONFIG = {
     "autoload": False,
     "last_model": "",
     "last_gpu_key": "",
+    # v0.58 — User-controlled font zoom. Applied on top of the HiDPI
+    # Tk scaling (see _configure_theme). Keyboard shortcuts:
+    #   Ctrl++ / Ctrl+=   → zoom in  (step +0.1)
+    #   Ctrl+-            → zoom out (step -0.1)
+    #   Ctrl+0            → reset to 1.0
+    # Clamped to [0.75, 2.0]. Takes effect immediately via the same
+    # theme-rebuild mechanism used for dark/light swap.
+    "font_scale": 1.0,
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -467,15 +475,79 @@ _MONO = "Consolas" if sys.platform == "win32" else (
         "Menlo" if sys.platform == "darwin" else "DejaVu Sans Mono")
 _BRAILLE_FONT = _MONO
 
-FONT_TITLE    = (_MONO, 15, "bold")
-FONT_SUBTITLE = (_MONO, 12)
-FONT_HEADER   = (_MONO, 11, "bold")
-FONT_BODY     = (_MONO, 11)
-FONT_BODY_B   = (_MONO, 11, "bold")
-FONT_SMALL    = (_MONO, 10)
-FONT_SMALL_B  = (_MONO, 10, "bold")
-FONT_DIM      = (_MONO, 10)
-FONT_BRAILLE  = (_BRAILLE_FONT, 12)
+# v0.58 — Font-size tuples are derived from these base sizes via
+# apply_font_scale(). The module-level FONT_* constants below are what
+# every widget references (by re-reading the tuple at build time), so
+# re-running apply_font_scale() + a theme rebuild propagates the new
+# sizes to every widget on screen. _refresh_fonts() (Linux font
+# upgrade) also routes through apply_font_scale so the current user
+# zoom is preserved across the post-Tk-root font re-resolution.
+_FONT_BASE = {
+    "TITLE":    15,
+    "SUBTITLE": 12,
+    "HEADER":   11,
+    "BODY":     11,
+    "SMALL":    10,
+    "DIM":      10,
+    "BRAILLE":  12,
+}
+
+FONT_SCALE_MIN  = 0.75
+FONT_SCALE_MAX  = 2.00
+FONT_SCALE_STEP = 0.10
+
+# The active scale is tracked at module level so _refresh_fonts() can
+# re-apply it after a font-family upgrade without needing access to the
+# launcher instance. Initialised to 1.0; the launcher overrides this
+# from cfg during __init__.
+_FONT_SCALE_CURRENT = 1.0
+
+FONT_TITLE    = (_MONO, _FONT_BASE["TITLE"], "bold")
+FONT_SUBTITLE = (_MONO, _FONT_BASE["SUBTITLE"])
+FONT_HEADER   = (_MONO, _FONT_BASE["HEADER"], "bold")
+FONT_BODY     = (_MONO, _FONT_BASE["BODY"])
+FONT_BODY_B   = (_MONO, _FONT_BASE["BODY"], "bold")
+FONT_SMALL    = (_MONO, _FONT_BASE["SMALL"])
+FONT_SMALL_B  = (_MONO, _FONT_BASE["SMALL"], "bold")
+FONT_DIM      = (_MONO, _FONT_BASE["DIM"])
+FONT_BRAILLE  = (_BRAILLE_FONT, _FONT_BASE["BRAILLE"])
+
+
+def apply_font_scale(scale: float) -> float:
+    """Rescale all FONT_* module globals relative to their base sizes.
+
+    Uses the currently-resolved _MONO / _BRAILLE_FONT family names, so
+    calling this after _refresh_fonts() has upgraded them to JetBrains
+    Mono / Fira Code on Linux will preserve those upgrades while
+    applying the user's zoom factor.
+
+    Clamped to [FONT_SCALE_MIN, FONT_SCALE_MAX] so runaway key-repeat
+    can't produce illegible or oversized fonts. Integer rounding with
+    a floor of 6 guarantees even the smallest fonts remain renderable
+    on the lowest zoom level. Returns the actually-applied scale so
+    the caller can persist it.
+    """
+    global FONT_TITLE, FONT_SUBTITLE, FONT_HEADER, FONT_BODY, FONT_BODY_B
+    global FONT_SMALL, FONT_SMALL_B, FONT_DIM, FONT_BRAILLE
+    global _FONT_SCALE_CURRENT
+
+    scale = max(FONT_SCALE_MIN, min(FONT_SCALE_MAX, float(scale)))
+    _FONT_SCALE_CURRENT = scale
+
+    def _sz(key: str) -> int:
+        return max(6, int(round(_FONT_BASE[key] * scale)))
+
+    FONT_TITLE    = (_MONO, _sz("TITLE"), "bold")
+    FONT_SUBTITLE = (_MONO, _sz("SUBTITLE"))
+    FONT_HEADER   = (_MONO, _sz("HEADER"), "bold")
+    FONT_BODY     = (_MONO, _sz("BODY"))
+    FONT_BODY_B   = (_MONO, _sz("BODY"), "bold")
+    FONT_SMALL    = (_MONO, _sz("SMALL"))
+    FONT_SMALL_B  = (_MONO, _sz("SMALL"), "bold")
+    FONT_DIM      = (_MONO, _sz("DIM"))
+    FONT_BRAILLE  = (_BRAILLE_FONT, _sz("BRAILLE"))
+    return scale
+
 
 def _refresh_fonts(root) -> None:
     """Re-resolve the FONT_* globals after a real Tk root exists.
@@ -484,26 +556,22 @@ def _refresh_fonts(root) -> None:
     this is effectively a no-op (platform fonts were already correct).
     On Linux it upgrades DejaVu to JetBrains Mono / Fira Code / etc.
     if one of those is installed.
+
+    v0.58 — delegates tuple construction to apply_font_scale() so that
+    any user font zoom in effect is preserved after the family upgrade.
+    Without this, switching the family here would reset tuple sizes to
+    the base values and silently undo Ctrl+Plus steps.
     """
     global _MONO, _BRAILLE_FONT
-    global FONT_TITLE, FONT_SUBTITLE, FONT_HEADER
-    global FONT_BODY, FONT_BODY_B, FONT_SMALL, FONT_SMALL_B
-    global FONT_DIM, FONT_BRAILLE
     new_mono = _pick_mono_font(root)
     new_braille = _pick_braille_font(root)
     if new_mono == _MONO and new_braille == _BRAILLE_FONT:
         return
     _MONO = new_mono
     _BRAILLE_FONT = new_braille
-    FONT_TITLE    = (_MONO, 15, "bold")
-    FONT_SUBTITLE = (_MONO, 12)
-    FONT_HEADER   = (_MONO, 11, "bold")
-    FONT_BODY     = (_MONO, 11)
-    FONT_BODY_B   = (_MONO, 11, "bold")
-    FONT_SMALL    = (_MONO, 10)
-    FONT_SMALL_B  = (_MONO, 10, "bold")
-    FONT_DIM      = (_MONO, 10)
-    FONT_BRAILLE  = (_BRAILLE_FONT, 12)
+    # Rebuild all FONT_* tuples with the new families at the current
+    # user-selected scale. _FONT_SCALE_CURRENT is the source of truth.
+    apply_font_scale(_FONT_SCALE_CURRENT)
 
 ACCENT_SOFT = "#60a5fa"
 ACCENT_TURBO = "#38bdf8"  # Sky blue — TurboQuant accent
@@ -2032,6 +2100,26 @@ class TurboQuantQLauncher(tk.Tk):
         else:
             self.is_dark = not bool(_light_override)
         self.theme = DARK_THEME if self.is_dark else LIGHT_THEME
+
+        # v0.58 — Apply persisted font zoom BEFORE any widget is built.
+        # apply_font_scale() rewrites the module-level FONT_* globals, and
+        # every widget picks up the current tuple at construction time, so
+        # setting it here is sufficient for the initial build. Later,
+        # Ctrl+Plus/Minus/0 re-invokes apply_font_scale() + triggers a
+        # theme-style rebuild so live zoom takes effect immediately.
+        # _refresh_fonts() (called from _configure_theme on Linux) also
+        # routes through apply_font_scale, so a font-family upgrade
+        # after Tk root init preserves this zoom. Clamped + sanitised
+        # by apply_font_scale itself, so a garbage value in the config
+        # can't crash the build.
+        try:
+            self.cfg["font_scale"] = apply_font_scale(
+                self.cfg.get("font_scale", 1.0))
+        except Exception:
+            # Defensive: if anything goes sideways, fall back to 1.0 so
+            # the launcher still comes up with readable default fonts.
+            self.cfg["font_scale"] = apply_font_scale(1.0)
+
         self.gpus: List[GPUInfo] = []
         self.models: List[ModelInfo] = []
         self.server_process: Optional[subprocess.Popen] = None
@@ -2139,6 +2227,32 @@ class TurboQuantQLauncher(tk.Tk):
             self._center_window(self, w, h)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # v0.58 — Font-zoom keyboard shortcuts. bind_all so the shortcuts
+        # fire regardless of which widget currently has focus (otherwise
+        # Ctrl+Plus inside the log Text widget would be eaten by Tk's
+        # default text binding). We listen on both the main-row "+" / "-"
+        # keys AND the numpad variants (KP_Add / KP_Subtract), plus the
+        # "=" key because on US/DE layouts Ctrl+= is what you actually
+        # press when you mean Ctrl+Plus without the Shift modifier —
+        # matches browser convention. Ctrl+0 resets to 100%.
+        #
+        # Bound here once in __init__ rather than inside the rebuild path
+        # so they survive theme swaps and font-zoom rebuilds — bind_all
+        # attaches to the root, which is never destroyed.
+        self.bind_all("<Control-plus>",
+                      lambda e: self._on_font_zoom(+FONT_SCALE_STEP))
+        self.bind_all("<Control-equal>",
+                      lambda e: self._on_font_zoom(+FONT_SCALE_STEP))
+        self.bind_all("<Control-KP_Add>",
+                      lambda e: self._on_font_zoom(+FONT_SCALE_STEP))
+        self.bind_all("<Control-minus>",
+                      lambda e: self._on_font_zoom(-FONT_SCALE_STEP))
+        self.bind_all("<Control-KP_Subtract>",
+                      lambda e: self._on_font_zoom(-FONT_SCALE_STEP))
+        self.bind_all("<Control-Key-0>",
+                      lambda e: self._on_font_zoom(0.0))
+
         if self._first_run:
             self.after(100, self._first_run_setup)
         else:
@@ -2739,6 +2853,191 @@ class TurboQuantQLauncher(tk.Tk):
 
         self._log(
             f"Theme switched to {'Light' if want_light else 'Dark'} mode.",
+            "info",
+        )
+
+    # ─── Font zoom (v0.58) ────────────────────────────────────────────────
+
+    def _on_font_zoom(self, delta: float):
+        """Change global font scale and rebuild the UI live.
+
+        delta semantics:
+          +FONT_SCALE_STEP → zoom in one notch
+          -FONT_SCALE_STEP → zoom out one notch
+          0.0              → reset to 1.0 (not "no change" — used by Ctrl+0)
+
+        Mechanics mirror _on_toggle_theme: persist state, rewrite the
+        module-level FONT_* tuples via apply_font_scale, nuke the widget
+        tree, rebuild, repopulate. The font tuples are re-read by every
+        widget at construction time, so the new sizes propagate on the
+        rebuild. No widget iteration or .config(font=...) gymnastics.
+
+        Refuses to run mid-operation (Probe, Bench All) for the same
+        reason theme-swap does: background threads write to widgets we
+        would be tearing down.
+        """
+        # Refuse during long-running background ops.
+        if self._probe_in_progress:
+            self._log("Font zoom unavailable during Probe run.", "warn")
+            return
+        if self._bench_thread is not None and self._bench_thread.is_alive():
+            self._log("Font zoom unavailable during Bench All run.", "warn")
+            return
+
+        # Compute new scale. delta=0.0 is the "reset to 1.0" convention.
+        if delta == 0.0:
+            new_scale = 1.0
+        else:
+            current = float(self.cfg.get("font_scale", 1.0))
+            new_scale = round(current + delta, 2)
+
+        # No-op guard: if we're already at the bounds and pushing further
+        # in the same direction, bail out before the expensive rebuild.
+        clamped = max(FONT_SCALE_MIN, min(FONT_SCALE_MAX, new_scale))
+        current = float(self.cfg.get("font_scale", 1.0))
+        if abs(clamped - current) < 0.001:
+            return
+
+        # ── Save state (mirror _on_toggle_theme) ──────────────────────
+        saved_log_dump = ""
+        try:
+            saved_log_dump = self._log_text.get("1.0", "end-1c")
+        except Exception:
+            pass
+        saved_sash = None
+        try:
+            _, saved_sash = self._paned.sash_coord(0)
+        except Exception:
+            pass
+        saved_sel_model = self._sel_model
+        saved_sel_row = self._sel_row
+
+        # ── Apply new scale + persist ─────────────────────────────────
+        applied = apply_font_scale(clamped)
+        self.cfg["font_scale"] = applied
+        try:
+            self._save_current_config()
+        except Exception:
+            pass
+
+        # ── Rebuild widget tree ───────────────────────────────────────
+        for child in list(self.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+
+        self._configure_theme()
+        self._build_header()
+        self._build_settings_bar()
+        self._build_footer()
+        self._paned = tk.PanedWindow(self, orient=tk.VERTICAL,
+                                      bg=self.theme.border,
+                                      sashwidth=5, sashrelief="flat",
+                                      handlesize=0, showhandle=False)
+        self._paned.pack(fill="both", expand=True, padx=16, pady=(4, 4))
+        self._build_model_list()
+        self._build_log_area()
+
+        # ── Repopulate cached state ───────────────────────────────────
+        try:
+            if self.gpus:
+                parts = []
+                for g in self.gpus:
+                    vram = f" ({g.vram_mb // 1024} GB)" if g.vram_mb else ""
+                    parts.append(f"GPU {g.index}: {g.name}{vram}")
+                if self._cpu_ram_gb > 0:
+                    parts.append(f"CPU RAM: {self._cpu_ram_gb:.0f} GB")
+                self._gpu_label.config(text="  •  ".join(parts))
+            elif self._cpu_ram_gb > 0:
+                self._gpu_label.config(
+                    text=f"No GPUs detected — CPU mode only — "
+                         f"CPU RAM: {self._cpu_ram_gb:.0f} GB")
+        except Exception:
+            pass
+
+        try:
+            cuda_ver = detect_cuda_version()
+            server_path = self.cfg.get("llama_server_path", "")
+            server_dir = os.path.dirname(server_path)
+            dll_results = check_required_dlls(server_dir) if server_dir else []
+            dll_found = sum(1 for d in dll_results if d["found"])
+            dll_total = len(dll_results)
+            cuda_parts = []
+            if cuda_ver:
+                cuda_parts.append(f"CUDA {cuda_ver} (driver)")
+            sp_lower = server_path.lower()
+            if "cuda128" in sp_lower:
+                cuda_parts.append("Build: CUDA 12.8")
+            elif "cuda132" in sp_lower:
+                cuda_parts.append("Build: CUDA 13.2")
+            elif server_dir:
+                cuda_parts.append(f"Build: {os.path.basename(server_dir)}")
+            if dll_total > 0:
+                if dll_found == dll_total:
+                    cuda_parts.append(f"DLLs: {dll_found}/{dll_total} ✓")
+                    dll_color = self.theme.fg_secondary
+                else:
+                    cuda_parts.append(f"DLLs: {dll_found}/{dll_total} ✗")
+                    dll_color = self.theme.yellow
+            else:
+                dll_color = self.theme.fg_dim
+                cuda_parts.append("DLLs: server path not set")
+            self._cuda_label.config(
+                text="  •  ".join(cuda_parts), foreground=dll_color)
+        except Exception:
+            pass
+
+        try:
+            self._build_gpu_buttons()
+        except Exception:
+            pass
+
+        try:
+            if self.models:
+                self._models_header.config(
+                    text=f"Models ({len(self.models)} GGUF, "
+                         f"{sum(m.size_gb for m in self.models):.0f} GB)")
+            self._rebuild_model_cards()
+        except Exception:
+            pass
+
+        try:
+            self._refresh_slot_buttons()
+        except Exception:
+            pass
+
+        if saved_log_dump:
+            try:
+                self._log_text.config(state="normal")
+                self._log_text.delete("1.0", "end")
+                self._log_text.insert("end", saved_log_dump + "\n", "info")
+                self._log_text.see("end")
+                self._log_text.config(state="disabled")
+            except Exception:
+                pass
+
+        if saved_sash is not None:
+            self.cfg["sash_pos"] = saved_sash
+            self.after(50, self._restore_sash)
+
+        if (saved_sel_model >= 0
+                and saved_sel_model < len(self.models)):
+            try:
+                self.after(60, lambda: self._select_cell(
+                    saved_sel_model, saved_sel_row))
+            except Exception:
+                pass
+
+        if self.running_model:
+            try:
+                self.after(70, self._update_running_indicator)
+            except Exception:
+                pass
+
+        self._log(
+            f"Font zoom: {int(applied * 100)}% "
+            f"(Ctrl+Plus / Ctrl+Minus / Ctrl+0 to adjust).",
             "info",
         )
 
@@ -6198,12 +6497,23 @@ class TurboQuantQLauncher(tk.Tk):
         # v0.56 — Autoload hook. Placed here (end of _do_initial_scan)
         # rather than in __init__ because we need self.models + the GPU
         # rows to be fully populated before _trigger_autoload_if_eligible
-        # can resolve the last (model, GPU) pair. Deliberately a plain
-        # function call, not an after(), so any failure is logged before
-        # the user interacts. Also fires on _first_run_setup path via the
-        # Paths dialog's on_close callback, which still routes through
-        # _do_initial_scan.
-        self._trigger_autoload_if_eligible()
+        # can resolve the last (model, GPU) pair. Also fires on
+        # _first_run_setup path via the Paths dialog's on_close callback,
+        # which still routes through _do_initial_scan.
+        #
+        # v0.58 — deferred to after_idle so it runs AFTER the default
+        # _select_cell(0, 0) queued at the end of card construction (see
+        # the `if self.models:` block in _build_model_cards). A plain
+        # synchronous call here would pick the correct (model, GPU) cell
+        # and then get clobbered moments later when the default-selection
+        # idle callback fires, leaving the selection rectangle on row
+        # (0, 0) while the running indicator correctly shows the
+        # autoloaded model elsewhere. after_idle serialises both calls
+        # into the same queue, so the autoload selection overwrites the
+        # default one in the right order. Failures are still logged
+        # before the user can meaningfully interact — after_idle fires
+        # well before the first input event.
+        self.after_idle(self._trigger_autoload_if_eligible)
 
     def _rescan_models(self):
         paths = [p for p in (self.cfg.get("llm_models_paths") or []) if p]
