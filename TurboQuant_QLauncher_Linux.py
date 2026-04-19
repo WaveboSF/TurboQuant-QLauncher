@@ -33,6 +33,8 @@ import json
 import glob
 import time
 import signal
+import socket
+import argparse
 import platform
 import subprocess
 import threading
@@ -71,7 +73,7 @@ def no_console_kwargs() -> dict:
 # SECTION: Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "0.55"
+APP_VERSION = "0.56"
 
 def get_launcher_dir() -> Path:
     """Return the directory where the launcher .py or compiled .exe lives.
@@ -107,9 +109,35 @@ LAUNCHER_DIR = get_launcher_dir()
 if IS_WINDOWS:
     CONFIG_FILE  = LAUNCHER_DIR / "TurboQuant_QLauncher.json"
     BENCH_FILE   = LAUNCHER_DIR / "TurboQuant_Benchmark_results.md"
+    LOCK_FILE    = LAUNCHER_DIR / "TurboQuant_QLauncher.lock"
 else:
     CONFIG_FILE  = LAUNCHER_DIR / "TurboQuant_QLauncher_Linux.json"
     BENCH_FILE   = LAUNCHER_DIR / "TurboQuant_Benchmark_results_Linux.md"
+    LOCK_FILE    = LAUNCHER_DIR / "TurboQuant_QLauncher_Linux.lock"
+
+# v0.56 — Single-instance lock + IPC for CLI control (MyIDE integration).
+#
+# GATING: The IPC listener + lock file are ONLY created when the user
+# has explicitly enabled "Autoload" in the footer. Autoload itself
+# unlocks only after the launcher has proven it can actually start a
+# llama-server on this machine (first "listening" line in the server
+# log flips cfg["install_verified"] permanently to True). Rationale: a
+# freshly installed / misconfigured launcher should never silently
+# open a local listening socket or spawn llama-server unattended at
+# startup. The user has to earn the "autopilot" state by completing
+# one successful manual run first, then explicitly opt in by clicking
+# the Autoload button.
+#
+# When enabled:
+#   - Lock file contains {"pid", "port", "started"} as JSON.
+#   - IPC server binds 127.0.0.1:<port>, accepts "SHUTDOWN" / "AUTOSTART"
+#     / "STATUS" commands. CLI calls like `--shutdown` read the lock
+#     file, connect to the control port, send the command, and exit.
+#     The running instance performs the action on its main thread
+#     (clean teardown + save config, no confirm dialog).
+#   - On the next launcher start, _trigger_autoload_if_eligible()
+#     fires the last-used (model, GPU) pair as soon as the initial
+#     scan completes.
 
 KV_CACHE_OPTIONS = {
     "f16 (default)":       {"ctk": None,     "ctv": None},
@@ -283,6 +311,24 @@ DEFAULT_CONFIG = {
     # Win example: "G:\\_Entwicklung\\llama-cpp-tq\\build\\bin\\Release"
     # Linux example: "/home/wavebo/llama-cpp-turboquant/build/bin"
     "update_binaries_source_path": "",
+    # v0.56 — Autoload + CLI control gating. Single user-facing flag:
+    # cfg["autoload"] is the master switch. When True, the launcher
+    # autoloads the last-used (model, GPU) pair on next start AND
+    # accepts CLI remote control (--autostart / --shutdown / --status)
+    # via a local IPC socket. When False, none of that happens.
+    #
+    # install_verified is the silent prerequisite: the Autoload button
+    # is locked until the launcher has proven it can actually start a
+    # llama-server on this machine (first "listening" line in the
+    # server log flips install_verified permanently to True).
+    #
+    # last_model / last_gpu_key record the most recent (model, GPU)
+    # combination that was successfully passed to _start_server, so
+    # autoload + `--autostart` know what to launch.
+    "install_verified": False,
+    "autoload": False,
+    "last_model": "",
+    "last_gpu_key": "",
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1133,6 +1179,15 @@ def load_config() -> dict:
     while len(paths) < MAX_MODELS_PATHS:
         paths.append("")
     cfg["llm_models_paths"] = paths[:MAX_MODELS_PATHS]
+    # v0.56 post-release refactor — merge the two-gate design
+    # (safe_settings + autoload checkbox) into a single "Autoload"
+    # footer toggle. Preserve user state: if either old flag was True,
+    # keep autoload enabled. Drop the legacy key so it doesn't linger
+    # in the on-disk config and cause confusion later.
+    if "safe_settings" in cfg:
+        cfg["autoload"] = bool(cfg.get("autoload", False)
+                               or cfg.get("safe_settings", False))
+        cfg.pop("safe_settings", None)
     return cfg
 
 def save_config(cfg: dict):
@@ -1546,15 +1601,148 @@ def _nut_compute_anchors(scores: dict, baseline_kv: str = "f16 (default)",
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SECTION: Single-instance Lock & IPC helpers (v0.56)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# These functions form the CLI side of the IPC protocol. The *server* side
+# (socket accept loop, command dispatch) lives inside TurboQuantQLauncher
+# as _start_ipc_server / _handle_ipc_client, because it needs `self` to
+# schedule main-thread work via `self.after`.
+#
+# Protocol (line-based, plain text over a local TCP connection):
+#   Client -> "SHUTDOWN\n"   Server -> "OK shutting down\n"
+#   Client -> "AUTOSTART\n"  Server -> "OK starting\n"  (or ERR ...)
+#   Client -> "STATUS\n"     Server -> "<JSON status>\n"
+#   Client -> anything else  Server -> "ERR unknown command\n"
+#
+# Not a general-purpose RPC. Only three commands, each a single word, each
+# with a single line reply. The server closes the connection after one
+# exchange. Intentionally minimal to keep the attack surface tiny — the
+# socket is bound to 127.0.0.1 only and only opens when the user has
+# explicitly enabled Autoload.
+
+def _pid_is_alive(pid: int) -> bool:
+    """Return True if a process with the given PID currently exists.
+
+    Cross-platform: uses OpenProcess/GetExitCodeProcess on Windows and
+    `os.kill(pid, 0)` on POSIX. Safe on both — neither call kills the
+    target process. Returns False on any failure (including permission
+    denied — which practically still means "not a process we can talk to").
+    """
+    if pid <= 0:
+        return False
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            h = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return False
+            try:
+                code = ctypes.c_ulong(0)
+                ok = ctypes.windll.kernel32.GetExitCodeProcess(
+                    h, ctypes.byref(code))
+                return bool(ok) and code.value == STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(h)
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+def read_lock_file() -> Optional[dict]:
+    """Return the lock file contents if a live instance owns it, else None.
+
+    Also removes stale lock files (PID no longer alive) as a side effect,
+    so the next launcher instance starts clean. Corrupt JSON is treated
+    as stale.
+    """
+    try:
+        if not LOCK_FILE.exists():
+            return None
+        with open(LOCK_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        pid = int(data.get("pid", 0))
+        port = int(data.get("port", 0))
+        if pid <= 0 or port <= 0:
+            raise ValueError("incomplete lock file")
+        if not _pid_is_alive(pid):
+            raise ValueError("stale PID")
+        return {"pid": pid, "port": port,
+                "started": data.get("started", "")}
+    except Exception:
+        # Stale or corrupt — delete so the next run can write a fresh one.
+        try:
+            LOCK_FILE.unlink()
+        except Exception:
+            pass
+        return None
+
+def send_ipc_command(port: int, command: str,
+                     timeout: float = 3.0) -> Optional[str]:
+    """Connect to 127.0.0.1:<port>, send one command, return one reply.
+
+    Returns the stripped reply string on success, None on any failure
+    (connection refused, timeout, etc.). The caller decides what to do
+    with None — usually "instance unreachable, give up quietly".
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", port),
+                                      timeout=timeout) as sock:
+            sock.sendall((command.strip() + "\n").encode("utf-8"))
+            sock.settimeout(timeout)
+            buf = b""
+            # Read until we get a newline or the server closes. Cap at
+            # 64 KB to avoid pathological responses wedging the CLI.
+            while b"\n" not in buf and len(buf) < 65536:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            return buf.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION: Main Application
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TurboQuantQLauncher(tk.Tk):
-    def __init__(self):
+    def __init__(self, autostart_override: Optional[bool] = None):
+        """Construct the launcher.
+
+        autostart_override:
+          None  -> honour cfg["autoload"] (default GUI behaviour)
+          True  -> force a one-shot autoload this session, regardless of
+                   the Autoload toggle state. Still requires
+                   install_verified (honest hardware check); otherwise
+                   it's silently ignored and a warning is logged.
+                   Triggered by `--autostart` on the CLI.
+          False -> force-skip autoload even if Autoload is ON. Triggered
+                   by `--no-autostart` on the CLI, handy for opening the
+                   GUI to change settings without accidentally kicking
+                   off a model load.
+        """
         super().__init__()
         self.title(f"TurboQuant QLauncher v{APP_VERSION}")
         self._first_run = not CONFIG_FILE.exists()
         self.cfg = load_config()
+        # v0.56 — CLI override from `--autostart` / `--no-autostart`. None
+        # means "use the config flag", True/False force a one-shot
+        # decision for this session only (never written back to cfg).
+        self._autostart_override = autostart_override
+        # v0.56 — IPC server state. Populated by _start_ipc_server when
+        # (and only when) Autoload is enabled. Stays None otherwise.
+        self._ipc_socket: Optional[socket.socket] = None
+        self._ipc_port: int = 0
+        self._ipc_accept_thread: Optional[threading.Thread] = None
         # Theme selection: explicit config override wins, else fall back
         # to OS dark-mode detection. The ☀/🌙 checkbox in the header
         # writes cfg["light_mode"] and prompts a restart (we don't do
@@ -1607,14 +1795,12 @@ class TurboQuantQLauncher(tk.Tk):
         # button, model double-click, Q/N/C mode buttons) check this
         # flag first and refuse to act while a probe is in progress.
         self._probe_in_progress: bool = False
-        # qnut v0.50 — reasoning-model warning bypass. The Probe worker
-        # forces No-Thinking on every server start (for deterministic
-        # outputs) but the existing _start_server warning would pop up
-        # before EVERY tuple. This flag suppresses the warning for the
-        # duration of a single Probe run; it is set in the worker after
-        # the user confirms the warning ONCE, and cleared in the same
-        # finally block that releases _probe_in_progress.
-        self._probe_thinking_warning_acknowledged: bool = False
+        # v0.56 — the _probe_thinking_warning_acknowledged flag that used
+        # to live here became dead code once the blocking "Reasoning
+        # Model — Thinking disabled" messagebox was removed from
+        # _start_server. Probe's own one-shot dialog is independent and
+        # still fires before each Probe run; it no longer needs to
+        # suppress anything at tuple-start time.
 
         self._configure_theme()
         self._build_header()
@@ -1681,6 +1867,19 @@ class TurboQuantQLauncher(tk.Tk):
             self.after(100, self._do_initial_scan)
         if self.cfg.get("sash_pos") is not None:
             self.after(150, self._restore_sash)
+
+        # v0.56 — Bring up the IPC control socket if (and only if) the user
+        # has already enabled Autoload in a previous session. For a fresh
+        # install / unverified / opted-out setup this is a no-op: no
+        # socket is bound, no lock file is written, nothing externally
+        # visible happens. The socket is (re)started / torn down on
+        # demand when the user flips the Autoload toggle at runtime.
+        if self.cfg.get("autoload", False):
+            self._start_ipc_server()
+
+        # Note: autoload triggering is done at the tail of
+        # _do_initial_scan, once self.models is guaranteed to be populated.
+        # See _trigger_autoload_if_eligible for the gating logic.
 
     # ─── Theme ────────────────────────────────────────────────────────────
 
@@ -2507,6 +2706,25 @@ class TurboQuantQLauncher(tk.Tk):
         cb_think.pack(side="left", padx=(8, 0))
         ToolTip(cb_think, "Disable reasoning/thinking mode (--reasoning off)", t)
 
+        # v0.56 — inline warning for reasoning models + No Thinking. Used
+        # to be a blocking messagebox that popped up every time the user
+        # started a reasoning model with No Thinking on; now it's a
+        # single-line label next to the checkbox. Starts empty (no
+        # warning) and is refreshed by _refresh_thinking_warning()
+        # whenever (a) the user toggles No Thinking, or (b) a different
+        # model row is selected.
+        self._thinking_warn_label = tk.Label(
+            row, text="", font=FONT_SMALL,
+            bg=t.bg, fg=t.yellow)
+        self._thinking_warn_label.pack(side="left", padx=(4, 0))
+        self._thinking_warn_tooltip = ToolTip(
+            self._thinking_warn_label, "", t)
+        # Trigger the refresh on checkbox toggle. Model-selection changes
+        # call _refresh_thinking_warning() directly from _select_cell
+        # (there's no StringVar tracking the active model to trace on).
+        self._no_think_var.trace_add(
+            "write", lambda *_: self._refresh_thinking_warning())
+
         self._bench_var = tk.BooleanVar(value=self.cfg.get("benchmark", False))
         cb_bench = themed_checkbutton(row, t, text="Benchmark",
                                        variable=self._bench_var)
@@ -2819,22 +3037,15 @@ class TurboQuantQLauncher(tk.Tk):
 
         # qnut v0.50 — Reasoning model pre-flight check.
         #
-        # The Probe worker will force No-Thinking on EVERY tuple to get
+        # The Probe worker will force No-Thinking on every tuple to get
         # deterministic outputs (otherwise the differential comparison
-        # sees noise from <think> blocks that vary even at temp=0). The
-        # standard _start_server warning would fire before every single
-        # tuple, blocking the worker each time.
-        #
-        # Solution: ask the user ONCE here, before the run starts, with
-        # an honest probe-specific explanation of the trade-off. Their
-        # answer is remembered for the duration of this Probe run only,
-        # via the _probe_thinking_warning_acknowledged flag which the
-        # worker sets after this dialog returns Yes and clears in its
-        # finally block.
-        #
-        # Reset the flag defensively so a previous Probe run's "yes"
-        # doesn't carry over.
-        self._probe_thinking_warning_acknowledged = False
+        # sees noise from <think> blocks that vary even at temp=0). We
+        # still ask the user ONCE here, before the run starts, with an
+        # honest probe-specific explanation of the trade-off, so they
+        # know the resulting Q/N/C anchors describe the non-thinking
+        # behaviour. (In v0.56 the blocking per-tuple warning in
+        # _start_server was dropped, so this one-shot dialog is the
+        # entire reasoning-model guard for Probe.)
 
         if _is_reasoning_model(model.filename):
             proceed = messagebox.askyesno(
@@ -2864,10 +3075,6 @@ class TurboQuantQLauncher(tk.Tk):
                     "warn",
                 )
                 return
-            # User accepted — set the bypass flag so _start_server
-            # doesn't re-prompt before every tuple. The worker will
-            # clear it in its finally block.
-            self._probe_thinking_warning_acknowledged = True
 
         t = self.theme
         dlg = tk.Toplevel(self)
@@ -3344,12 +3551,6 @@ class TurboQuantQLauncher(tk.Tk):
 
             # Release the concurrency lock and re-enable the mode buttons
             self._probe_in_progress = False
-            # Clear the reasoning-warning bypass so the next normal
-            # _start_server call (outside of a Probe run) sees the
-            # warning again. Important: this MUST be cleared even on
-            # cancel/exception so a future non-Probe server start with
-            # No-Thinking on a reasoning model is not silently allowed.
-            self._probe_thinking_warning_acknowledged = False
             self._main_thread_call(lambda: self._refresh_mode_button_state())
 
     def _nut_save_profile(self, filename: str,
@@ -4141,6 +4342,26 @@ class TurboQuantQLauncher(tk.Tk):
                     width=group_c_w, height=_BTN_H, font=FONT_SMALL,
                     command=self._show_paths_dialog).pack(side="right", padx=2)
 
+        # v0.56 — Autoload toggle. Sits just left of Paths in the footer.
+        # Three visual states, all rendered with the same label "Autoload"
+        # so the button's width stays constant across transitions — state
+        # is encoded in color + corner_glyph only, never in text length:
+        #   locked  = install_verified==False  -> grey, disabled, "🔒" glyph
+        #   OFF     = verified, autoload==False -> ACCENT_SOFT, no glyph
+        #   ON      = autoload==True            -> green, "✓" glyph
+        # _refresh_autoload_btn() applies the initial state and is also
+        # called whenever install_verified flips (first "listening") or
+        # the user clicks the button.
+        al_w = self._measure_label_group_width(
+            ["Autoload"], bold=False, h_pad=_H_PAD)
+        self._autoload_btn = HoverButton(
+            bar, t, text="Autoload", color=t.border,
+            width=al_w, height=_BTN_H, font=FONT_SMALL,
+            command=self._on_autoload_click)
+        self._autoload_btn.pack(side="right", padx=2)
+        self._autoload_tooltip = ToolTip(self._autoload_btn, "", t)
+        self._refresh_autoload_btn()
+
         save_w = self._measure_label_group_width(
             ["💾  Save Results..."], bold=False, h_pad=_H_PAD)
         self._save_bench_btn = HoverButton(bar, t, text="💾  Save Results...",
@@ -4456,6 +4677,18 @@ class TurboQuantQLauncher(tk.Tk):
 
         rd = card_data["gpu_rows"][row_idx]
         rd["frame"].config(highlightbackground=t.accent)
+
+        # v0.56 — refresh the inline "No Thinking on reasoning model"
+        # warning whenever the selected model changes. No-op when the
+        # warning is already empty (non-reasoning model) or No Thinking
+        # is off.
+        try:
+            self._refresh_thinking_warning()
+        except Exception:
+            # Defensive: early calls during widget build may fire before
+            # the warning label exists. The method's own hasattr guard
+            # handles that, but wrap anyway to be safe across reload.
+            pass
 
         if scroll == "into":
             # Ensure geometry is up-to-date — winfo_height() returns 1
@@ -5277,36 +5510,25 @@ class TurboQuantQLauncher(tk.Tk):
             cmd.extend(["-fa", "on"])
 
         if self._no_think_var.get():
-            # Guard against silently disabling thinking on reasoning
-            # models. Gemma 4 26B-A4B accuracy drops from ~97% to ~64% on
-            # the math suite when thinking is off — warn the user before
-            # launching. They can still proceed if it's intentional.
-            #
-            # qnut v0.50: skip this warning if the Probe worker has
-            # already obtained explicit acknowledgement from the user
-            # at the start of its run. Without this bypass the dialog
-            # would re-appear before every single tuple (potentially
-            # 24 times per Probe run) and block the worker on each one.
-            if (_is_reasoning_model(filename)
-                    and not self._probe_thinking_warning_acknowledged):
-                proceed = messagebox.askyesno(
-                    "Reasoning Model — Thinking disabled",
-                    f"'{filename}' looks like a reasoning-capable model "
-                    f"(Gemma 4 / Qwen3 / DeepSeek-R1 / QwQ family).\n\n"
-                    f"'No Thinking' is currently ENABLED, which can drop "
-                    f"accuracy dramatically on math and logic tasks "
-                    f"(Gemma 4 26B: ~97% → ~64% on our suite).\n\n"
-                    f"Start the server with thinking disabled anyway?",
-                    icon="warning",
-                    default="no",
-                )
-                if not proceed:
-                    self._log(
-                        f"Server start cancelled by user — "
-                        f"'No Thinking' flag guard on reasoning model",
-                        "warn",
-                    )
-                    return
+            # v0.56 — the blocking "Reasoning model — thinking disabled"
+            # messagebox was removed. It fired before every single server
+            # start of a reasoning model, which got tedious fast when
+            # switching models back-to-back. Replaced with:
+            #   (a) an inline warning text in the settings bar, rendered
+            #       dynamically by _refresh_thinking_warning() whenever
+            #       the selected model + the No Thinking toggle combine
+            #       into a "dangerous" state. The user sees it without
+            #       being interrupted.
+            #   (b) a single log line at the moment of starting, so the
+            #       Server Log records that the combination was used.
+            if _is_reasoning_model(filename):
+                self._log(
+                    f"Note: '{filename}' is a reasoning-capable model "
+                    f"and 'No Thinking' is ON. Accuracy on math / logic "
+                    f"tasks may drop substantially (e.g. Gemma 4 26B: "
+                    f"~97% → ~64% on our suite). Uncheck 'No Thinking' "
+                    f"if this was unintentional.",
+                    "warn")
             cmd.extend(["--reasoning", "off"])
 
         port = self._port_var.get()
@@ -5370,6 +5592,16 @@ class TurboQuantQLauncher(tk.Tk):
             # tearing down and restarting an identical server).
             self._running_kv = self._kv_var.get()
             self._running_la = self._la_var.get()
+
+            # v0.56 — record the (model, GPU) pair so autoload +
+            # `--autostart` know what to launch next session. We save it
+            # at the Popen-succeeded point, BEFORE waiting for "listening",
+            # on purpose: if the user kills the launcher mid-load we still
+            # want the pair recorded. install_verified is what gates
+            # autoload at the actual launcher level, and that flag is only
+            # flipped once we've seen "listening" (see _read_server_output).
+            self.cfg["last_model"]   = filename
+            self.cfg["last_gpu_key"] = gpu_key
 
             self._update_status_loading(filename, port)
             self._update_running_indicator()
@@ -5447,10 +5679,29 @@ class TurboQuantQLauncher(tk.Tk):
                         fn  = self.running_model or ""
                         prt = getattr(self, "_running_port", "8080")
                         self.after(0, self._upgrade_status_to_running, fn, prt)
+                    # v0.56 — First time we see the server announce it's
+                    # actually listening on its port, the installation is
+                    # proven to work. This one-way flip unlocks the
+                    # "Autoload" button for the user. Runs on the main
+                    # thread to keep cfg writes single-threaded.
+                    if ("listening" in ll
+                            and not self.cfg.get("install_verified", False)):
+                        self.after(0, self._mark_install_verified)
                     self.after(0, self._log, line, tag)
         except Exception:
             pass
         self.after(0, self._on_server_exited)
+
+    def _mark_install_verified(self):
+        """Flip the install-verified flag (main thread only)."""
+        if self.cfg.get("install_verified", False):
+            return
+        self.cfg["install_verified"] = True
+        save_config(self.cfg)
+        self._log(
+            "Installation verified — llama-server is listening. "
+            "Autoload is now unlockable (footer).", "good")
+        self._refresh_autoload_btn()
 
     def _upgrade_status_to_running(self, filename: str, port: str):
         """Switch status from Loading → Running (called on main thread)."""
@@ -5595,6 +5846,16 @@ class TurboQuantQLauncher(tk.Tk):
         # when the current llama_server_path changes, e.g. after a slot click
         # or a Paths dialog save).
         self._refresh_slot_buttons()
+
+        # v0.56 — Autoload hook. Placed here (end of _do_initial_scan)
+        # rather than in __init__ because we need self.models + the GPU
+        # rows to be fully populated before _trigger_autoload_if_eligible
+        # can resolve the last (model, GPU) pair. Deliberately a plain
+        # function call, not an after(), so any failure is logged before
+        # the user interacts. Also fires on _first_run_setup path via the
+        # Paths dialog's on_close callback, which still routes through
+        # _do_initial_scan.
+        self._trigger_autoload_if_eligible()
 
     def _rescan_models(self):
         paths = [p for p in (self.cfg.get("llm_models_paths") or []) if p]
@@ -6192,6 +6453,10 @@ class TurboQuantQLauncher(tk.Tk):
         self.cfg["benchmark"] = self._bench_var.get()
         self.cfg["bench_all"] = self._bench_all_var.get()
         self.cfg["layer_adaptive"] = self._la_var.get()
+        # v0.56 — cfg["autoload"] is written directly by _on_autoload_click
+        # (so it's durable the moment the user flips the toggle, even if
+        # the launcher crashes before a normal save). install_verified is
+        # written by _mark_install_verified. Neither needs a write here.
         try:
             self.cfg["window_x"] = self.winfo_x()
             self.cfg["window_y"] = self.winfo_y()
@@ -6207,8 +6472,383 @@ class TurboQuantQLauncher(tk.Tk):
             pass
         save_config(self.cfg)
 
+    # ─── Inline "No Thinking on reasoning model" warning ────────────────
+
+    def _refresh_thinking_warning(self):
+        """Show/hide the inline warning next to the No Thinking checkbox.
+
+        Called after two kinds of events:
+          - the user toggles No Thinking (via trace_add on _no_think_var)
+          - the user selects a different model row (via _select_cell)
+        The label stays empty unless BOTH conditions are true:
+          - No Thinking is checked
+          - the currently selected model is a reasoning model
+        When both hold, a short yellow "⚠ reasoning model" message
+        appears next to the checkbox, and its tooltip carries the long
+        explanation that used to live in the removed messagebox.
+        """
+        # Widgets may not exist yet during early __init__ — guard.
+        if not hasattr(self, "_thinking_warn_label"):
+            return
+        # Resolve the currently selected model, if any.
+        filename = None
+        try:
+            if (0 <= self._sel_model < len(self.models)):
+                filename = self.models[self._sel_model].filename
+        except (AttributeError, IndexError):
+            filename = None
+        show = (self._no_think_var.get()
+                and filename is not None
+                and _is_reasoning_model(filename))
+        if show:
+            self._thinking_warn_label.config(
+                text="⚠ reasoning model",
+                fg=self.theme.yellow)
+            self._thinking_warn_tooltip.update_text(
+                f"'{filename}' is a reasoning-capable model "
+                f"(Gemma 4 / Qwen3 / DeepSeek-R1 / QwQ family).\n\n"
+                f"'No Thinking' is ON, which can drop accuracy "
+                f"dramatically on math and logic tasks (Gemma 4 26B: "
+                f"~97% → ~64% on our suite).\n\n"
+                f"Uncheck 'No Thinking' if this was unintentional.")
+        else:
+            self._thinking_warn_label.config(text="")
+            self._thinking_warn_tooltip.update_text("")
+
+    # ─── Autoload toggle (footer button) ────────────────────────────────
+
+    def _refresh_autoload_btn(self):
+        """Re-paint the Autoload button to reflect the current state.
+
+        Called after any event that can change the state: button click,
+        first successful server listen (flips install_verified), startup.
+        The button's label stays fixed at "Autoload" — state is encoded
+        purely in color + corner_glyph + disabled, so button width never
+        jitters between transitions.
+        """
+        if not hasattr(self, "_autoload_btn"):
+            return
+        t = self.theme
+        verified = bool(self.cfg.get("install_verified", False))
+        enabled  = bool(self.cfg.get("autoload",         False))
+        if not verified:
+            # Locked — user hasn't completed a successful run yet.
+            self._autoload_btn.configure_btn(
+                color=t.border, state="disabled",
+                corner_glyph="🔒")
+            self._autoload_tooltip.update_text(
+                "Autoload — locked.\n\n"
+                "Complete one successful model start first. Once the "
+                "llama-server reports 'listening' in the Server Log, "
+                "this button unlocks and you can opt into autoload + "
+                "CLI remote control (--autostart / --shutdown).")
+        elif enabled:
+            # ON — IPC listener is running, autoload fires on next start.
+            self._autoload_btn.configure_btn(
+                color=t.green, state="normal",
+                corner_glyph="✓")
+            port_info = (f"  (IPC on 127.0.0.1:{self._ipc_port})"
+                         if self._ipc_port else "")
+            self._autoload_tooltip.update_text(
+                f"Autoload — ON.{port_info}\n\n"
+                "On the next launcher start the last-used model + GPU "
+                "will be launched automatically. TurboQuant also "
+                "accepts CLI commands from other tools (e.g. MyIDE):\n"
+                "  TurboQuant_QLauncher --autostart\n"
+                "  TurboQuant_QLauncher --shutdown\n"
+                "  TurboQuant_QLauncher --status\n\n"
+                "Click to disable.")
+        else:
+            # OFF — unlocked but opted out.
+            self._autoload_btn.configure_btn(
+                color=ACCENT_SOFT, state="normal",
+                corner_glyph=None)
+            self._autoload_tooltip.update_text(
+                "Autoload — OFF.\n\n"
+                "Click to enable: the launcher will automatically start "
+                "the last-used model + GPU on future launcher starts, "
+                "and will accept CLI remote control "
+                "(--autostart / --shutdown / --status) from external "
+                "tools. A local listening socket on 127.0.0.1 opens "
+                "and a lock file appears next to the config.")
+
+    def _on_autoload_click(self):
+        """User clicked the Autoload toggle. Flip state + (re)start IPC."""
+        if not self.cfg.get("install_verified", False):
+            # Should be unreachable (button is disabled in locked state)
+            # but guard anyway.
+            return
+        new_state = not bool(self.cfg.get("autoload", False))
+        self.cfg["autoload"] = new_state
+        save_config(self.cfg)
+        if new_state:
+            self._start_ipc_server()
+            self._log(
+                "Autoload enabled — IPC listener active; the last-used "
+                "(model, GPU) will launch automatically on next start.",
+                "good")
+        else:
+            self._stop_ipc_server()
+            self._log(
+                "Autoload disabled — IPC listener stopped; no automatic "
+                "launch on next start.", "info")
+        self._refresh_autoload_btn()
+
+    def _trigger_autoload_if_eligible(self):
+        """Run the last-used (model, GPU) if the gate permits.
+
+        Gating precedence:
+          1. CLI override `--no-autostart` wins over everything (force skip).
+          2. CLI override `--autostart` wins over cfg (force run).
+          3. Otherwise honour cfg["autoload"].
+        In all three "run" paths we additionally require:
+          - install_verified (otherwise the launcher has no business
+            auto-spawning anything)
+          - last_model exists in the current scan
+          - no server already running (don't clobber an in-flight launch)
+        Each bail-out is logged so the user can see *why* autoload didn't
+        fire on startup.
+        """
+        # 1. CLI override
+        if self._autostart_override is False:
+            self._log("Autoload skipped (--no-autostart override).", "info")
+            return
+        want_autoload = (self._autostart_override is True
+                         or bool(self.cfg.get("autoload", False)))
+        if not want_autoload:
+            return
+        # 2. Safety gates
+        if not self.cfg.get("install_verified", False):
+            self._log(
+                "Autoload requested but install is not verified yet — "
+                "skipping. Start a model manually once to unlock.", "warn")
+            return
+        if self.server_process:
+            self._log(
+                "Autoload skipped — a server is already running.", "info")
+            return
+        # 3. Resolve last model
+        last_model = (self.cfg.get("last_model", "") or "").strip()
+        last_gpu   = (self.cfg.get("last_gpu_key", "") or "GPU 0").strip()
+        if not last_model:
+            self._log(
+                "Autoload: no previous model recorded — skipping. "
+                "Start a model manually once to record it.", "warn")
+            return
+        model = next((m for m in self.models if m.filename == last_model), None)
+        if not model:
+            self._log(
+                f"Autoload: last model '{last_model}' not found in the "
+                f"current scan — skipping.", "warn")
+            return
+        # 4. Select the matching GPU row in the UI (best-effort; falls
+        #    back to row 0 if the GPU is no longer present — e.g. the
+        #    user swapped hardware between runs).
+        model_idx = self.models.index(model)
+        row_idx = 0
+        card = self._model_cards.get(last_model)
+        if card:
+            for i, gpu_row in enumerate(card.get("gpu_rows", [])):
+                if gpu_row.get("key") == last_gpu:
+                    row_idx = i
+                    break
+            else:
+                self._log(
+                    f"Autoload: last GPU '{last_gpu}' not present — "
+                    f"falling back to first available row.", "warn")
+        try:
+            self._select_cell(model_idx, row_idx, scroll="into")
+        except Exception:
+            # Non-fatal; just means the selection highlight didn't update.
+            pass
+        self._log(
+            f"Autoload: starting {last_model} on {last_gpu}.", "good")
+        # Use _on_run_model so the same stop-then-start machinery kicks in
+        # that a manual Run click would use.
+        self._on_run_model(last_model, last_gpu)
+
+    # ─── IPC server (Autoload gated) ─────────────────────────────────────
+
+    def _start_ipc_server(self):
+        """Bind a local TCP control socket and write the lock file.
+
+        No-op if already running. Prefers a previously-assigned port (so
+        we don't burn through ephemeral ports on each toggle) but is
+        happy with any free port the kernel hands us. Binding errors are
+        logged and leave the launcher otherwise functional — Autoload
+        is essentially a no-op in that case, but the GUI keeps running.
+        """
+        if self._ipc_socket is not None:
+            return
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))  # kernel picks a free port
+            sock.listen(4)
+            self._ipc_socket = sock
+            self._ipc_port = sock.getsockname()[1]
+        except Exception as e:
+            self._log(f"IPC: failed to bind control socket: {e}", "error")
+            self._ipc_socket = None
+            self._ipc_port = 0
+            return
+
+        # Write the lock file so external tools (and a second launcher
+        # launch) can find us.
+        try:
+            with open(LOCK_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "pid": os.getpid(),
+                    "port": self._ipc_port,
+                    "started": datetime.now().isoformat(timespec="seconds"),
+                    "version": APP_VERSION,
+                }, f)
+        except Exception as e:
+            self._log(f"IPC: failed to write lock file: {e}", "warn")
+
+        # Accept loop runs in a daemon thread. Per-connection handlers
+        # are also daemons so shutdown doesn't have to reap them.
+        def _accept_loop():
+            while True:
+                try:
+                    conn, _addr = sock.accept()
+                except OSError:
+                    # Socket was closed from _stop_ipc_server — exit loop.
+                    return
+                except Exception:
+                    # Transient error — keep serving.
+                    continue
+                threading.Thread(
+                    target=self._handle_ipc_client,
+                    args=(conn,),
+                    daemon=True).start()
+        self._ipc_accept_thread = threading.Thread(
+            target=_accept_loop, daemon=True)
+        self._ipc_accept_thread.start()
+
+    def _stop_ipc_server(self):
+        """Tear down the control socket + lock file. Safe to call twice."""
+        if self._ipc_socket is None:
+            # Still clean up a stray lock file if one exists from a prior run.
+            self._cleanup_lock_file()
+            return
+        try:
+            self._ipc_socket.close()
+        except Exception:
+            pass
+        self._ipc_socket = None
+        self._ipc_port = 0
+        self._ipc_accept_thread = None
+        self._cleanup_lock_file()
+
+    def _cleanup_lock_file(self):
+        try:
+            if LOCK_FILE.exists():
+                LOCK_FILE.unlink()
+        except Exception:
+            pass
+
+    def _handle_ipc_client(self, conn):
+        """Process one IPC command and close the connection.
+
+        Runs on a worker thread. Any work that touches Tk state is
+        dispatched to the main thread via self.after(...). The socket is
+        closed unconditionally at the end so a misbehaving client can't
+        leak file descriptors.
+        """
+        try:
+            with conn:
+                conn.settimeout(5)
+                buf = b""
+                while b"\n" not in buf and len(buf) < 4096:
+                    try:
+                        chunk = conn.recv(1024)
+                    except socket.timeout:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                command = buf.decode("utf-8", errors="replace").strip()
+                parts = command.split()
+                if not parts:
+                    try:
+                        conn.sendall(b"ERR empty\n")
+                    except Exception:
+                        pass
+                    return
+                cmd = parts[0].upper()
+
+                if cmd == "SHUTDOWN":
+                    # Reply first, THEN schedule the shutdown, so the
+                    # caller sees a clean "OK" before we tear down. The
+                    # 100 ms delay gives the reply time to flush.
+                    try:
+                        conn.sendall(b"OK shutting down\n")
+                    except Exception:
+                        pass
+                    self.after(100, self._on_close)
+
+                elif cmd == "AUTOSTART":
+                    # Optional extension: AUTOSTART MODEL GPU
+                    # lets MyIDE override the recorded last model.
+                    new_model = parts[1] if len(parts) > 1 else None
+                    new_gpu   = parts[2] if len(parts) > 2 else None
+                    def _fire():
+                        if new_model:
+                            self.cfg["last_model"] = new_model
+                        if new_gpu:
+                            self.cfg["last_gpu_key"] = new_gpu
+                        if new_model or new_gpu:
+                            save_config(self.cfg)
+                        # Temporarily force-on the override for this run
+                        # regardless of the toggle state, then fire.
+                        prev = self._autostart_override
+                        self._autostart_override = True
+                        try:
+                            self._trigger_autoload_if_eligible()
+                        finally:
+                            self._autostart_override = prev
+                    try:
+                        conn.sendall(b"OK starting\n")
+                    except Exception:
+                        pass
+                    self.after(50, _fire)
+
+                elif cmd == "STATUS":
+                    status = {
+                        "version":       APP_VERSION,
+                        "pid":           os.getpid(),
+                        "ipc_port":      self._ipc_port,
+                        "running_model": self.running_model,
+                        "running_gpu":   self._running_gpu_key,
+                        "running_port":  getattr(self, "_running_port", None),
+                        "last_model":    self.cfg.get("last_model", ""),
+                        "last_gpu_key":  self.cfg.get("last_gpu_key", ""),
+                        "autoload":      bool(self.cfg.get("autoload", False)),
+                        "install_verified":
+                            bool(self.cfg.get("install_verified", False)),
+                    }
+                    try:
+                        conn.sendall(
+                            (json.dumps(status) + "\n").encode("utf-8"))
+                    except Exception:
+                        pass
+
+                else:
+                    try:
+                        conn.sendall(b"ERR unknown command\n")
+                    except Exception:
+                        pass
+        except Exception:
+            # Never let an IPC client crash the launcher.
+            pass
+
     def _on_close(self):
         self._save_current_config()
+        # v0.56 — Tear down the IPC listener *before* we destroy Tk, so
+        # an in-flight AUTOSTART command can't schedule main-thread work
+        # on a dying interpreter.
+        self._stop_ipc_server()
         if self.server_process:
             self._stop_server(silent=True)
         self.destroy()
@@ -6236,7 +6876,154 @@ class TurboQuantQLauncher(tk.Tk):
 # SECTION: Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse CLI arguments for the launcher.
+
+    Split into its own function so main() stays readable and so we can
+    unit-test argument parsing without spinning up Tk.
+
+    Flags:
+      --autostart / -a     Force one-shot autoload this session regardless
+                           of the Autoload toggle state. If another
+                           instance is already running with Autoload ON,
+                           the command is forwarded via IPC and the new
+                           process exits. Requires install_verified;
+                           otherwise the launcher opens normally with a
+                           warning logged.
+      --no-autostart       Force-skip autoload even if the toggle is ON.
+                           Useful for opening the GUI to tweak settings
+                           without kicking off a model load.
+      --shutdown / -q      Ask a running instance to quit cleanly (stop
+                           llama-server, save config, close window). No
+                           dialog, no confirmation. Exits 0 on success,
+                           exit 1 if no reachable instance.
+      --status             Print a JSON status report from the running
+                           instance to stdout and exit. Exit 1 if no
+                           reachable instance.
+      --version            Print version and exit.
+    """
+    p = argparse.ArgumentParser(
+        prog="TurboQuant_QLauncher",
+        description=(
+            "TurboQuant QLauncher — llama-server model switcher with "
+            "TurboQuant KV-cache support. CLI mode is intended for "
+            "external tools (e.g. MyIDE) and requires 'Autoload' to be "
+            "enabled in the GUI first."),
+        # Keep the epilog readable — argparse wraps it automatically.
+        epilog=(
+            "Usage examples:\n"
+            "  TurboQuant_QLauncher                  open the GUI normally\n"
+            "  TurboQuant_QLauncher --autostart      open + start last model\n"
+            "  TurboQuant_QLauncher --shutdown       ask running instance to quit\n"
+            "  TurboQuant_QLauncher --status         print instance status as JSON"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # Mutually-exclusive autostart group so -a and --no-autostart can't
+    # both be passed in the same call (would be nonsensical).
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("-a", "--autostart", action="store_true",
+                   help="Force autoload for this session.")
+    g.add_argument("--no-autostart", action="store_true",
+                   help="Skip autoload for this session.")
+    p.add_argument("-q", "--shutdown", action="store_true",
+                   help="Tell a running instance to close cleanly and exit.")
+    p.add_argument("--status", action="store_true",
+                   help="Print JSON status from the running instance, "
+                        "then exit.")
+    p.add_argument("--version", action="version",
+                   version=f"TurboQuant QLauncher v{APP_VERSION}")
+    return p.parse_args(argv)
+
+
+def _handle_cli_only_commands(args: argparse.Namespace) -> Optional[int]:
+    """Handle commands that don't need a GUI: --shutdown, --status.
+
+    Returns an exit code (0 or 1) if the command was fully handled here
+    and the caller should exit now. Returns None when the launcher must
+    proceed to open the GUI (covers plain launch and --autostart).
+    """
+    if not (args.shutdown or args.status):
+        return None
+
+    lock = read_lock_file()
+    if lock is None:
+        # No running instance. For --shutdown we treat "nothing to do" as
+        # success (0): MyIDE can call this unconditionally on its own
+        # shutdown path without racing a startup. For --status it's a
+        # genuine failure (1): the caller explicitly wants a report.
+        if args.shutdown:
+            print("TurboQuant is not running.", file=sys.stderr)
+            return 0
+        else:
+            print("TurboQuant is not running.", file=sys.stderr)
+            return 1
+
+    port = lock.get("port", 0)
+
+    if args.shutdown:
+        reply = send_ipc_command(port, "SHUTDOWN")
+        if reply is None:
+            print(
+                f"Could not reach running instance on 127.0.0.1:{port}. "
+                f"Is Autoload still enabled?", file=sys.stderr)
+            return 1
+        # Best-effort wait for the instance to actually go away. The
+        # IPC handler sends "OK" before the 100 ms teardown hook fires,
+        # so the socket is still reachable for a moment. We poll the
+        # lock file (which is removed in _on_close → _stop_ipc_server).
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if not LOCK_FILE.exists():
+                break
+            # Re-read will also purge a stale lock if the PID died.
+            if read_lock_file() is None:
+                break
+            time.sleep(0.1)
+        print("TurboQuant closed.")
+        return 0
+
+    if args.status:
+        reply = send_ipc_command(port, "STATUS")
+        if reply is None:
+            print(
+                f"Could not reach running instance on 127.0.0.1:{port}.",
+                file=sys.stderr)
+            return 1
+        # Reply is a single line of JSON. Print verbatim so callers can
+        # pipe it into jq / their own JSON parser.
+        print(reply)
+        return 0
+
+    return None
+
+
 def main():
+    args = _parse_cli_args()
+
+    # CLI-only paths (shutdown/status) take precedence over GUI startup.
+    # They neither require nor benefit from Tk, so we short-circuit here.
+    rc = _handle_cli_only_commands(args)
+    if rc is not None:
+        sys.exit(rc)
+
+    # v0.56 — Single-instance coordination for --autostart. If an
+    # instance with Autoload is already running, forward the AUTOSTART
+    # command and exit; don't try to spin up a second Tk. Plain
+    # launches (no --autostart) just open a second window on purpose —
+    # matches legacy behaviour.
+    if args.autostart:
+        lock = read_lock_file()
+        if lock is not None:
+            reply = send_ipc_command(lock["port"], "AUTOSTART")
+            if reply is not None:
+                print("TurboQuant already running — autostart forwarded.")
+                sys.exit(0)
+            # Fell through — existing instance is unreachable. Proceed
+            # to start a new one rather than failing.
+            print(
+                "Existing instance did not reply; starting a new one.",
+                file=sys.stderr)
+
     # Hide the console window on Windows when launched via py.exe / python.exe
     if sys.platform == "win32":
         try:
@@ -6247,7 +7034,18 @@ def main():
         except Exception:
             pass
 
-    app = TurboQuantQLauncher()
+    # Translate CLI flags to the __init__ override triple-state:
+    #   --autostart    -> True
+    #   --no-autostart -> False
+    #   (neither)      -> None
+    if args.autostart:
+        autostart_override: Optional[bool] = True
+    elif args.no_autostart:
+        autostart_override = False
+    else:
+        autostart_override = None
+
+    app = TurboQuantQLauncher(autostart_override=autostart_override)
     app.mainloop()
 
 if __name__ == "__main__":
