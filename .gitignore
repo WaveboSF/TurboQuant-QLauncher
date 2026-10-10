@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.exe
+*.dll
+# Runtime files created next to the launcher (settings, API key, lock, results)
+TurboQuant_QLauncher.json
+TurboQuant_QLauncher_Linux.json
+key.json
+key_Linux.json
+*.lock
+TurboQuant_Benchmark_results*.md
