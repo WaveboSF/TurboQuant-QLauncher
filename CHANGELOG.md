@@ -17,7 +17,6 @@ License: MIT · © WaveboSF 2026
 - A tested compatibility fallback for a known model/build combination, with a notice during loading that clears when the selected model is ready.
 - Editable context size, clearer start and stop controls, and a button to open the local server in a browser.
 - Updated project credits, upstream references and license notices. Release packages exclude user configurations, models and inference-server binaries.
-- A demonstration screenshot with fictional devices, capacities and models.
 
 ### Platform notes
 - Linux requires a compatible system `libgcc_s.so.1`.
