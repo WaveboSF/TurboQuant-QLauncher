@@ -8,9 +8,26 @@ License: MIT · © WaveboSF 2026
 
 ---
 
-## v1.37
+## v1.44 — native release
 
-Current release. One source file, `TurboQuant_QLauncher.py`, for Windows
+### Added and changed
+- Native Rust desktop packages for Linux and Windows; inference engines and models are configured separately.
+- Backend selection for llama.cpp / TurboQuant and supported Flash-Next / Strata profiles. Model and cache support depend on the selected backend and build.
+- `Comb.GPU` selection for compatible NVIDIA devices with a supporting server; the launcher rechecks the available devices before starting.
+- A tested compatibility fallback for a known model/build combination, with a notice during loading that clears when the selected model is ready.
+- Editable context size, clearer start and stop controls, and a button to open the local server in a browser.
+- Updated project credits, upstream references and license notices. Release packages exclude user configurations, models and inference-server binaries.
+- A demonstration screenshot with fictional devices, capacities and models.
+
+### Platform notes
+- Linux requires a compatible system `libgcc_s.so.1`.
+- Windows requires the separately installed [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist/). The Windows package has been checked under Wine; a real Windows hardware test is pending.
+
+---
+
+## v1.37 — historical Python release
+
+Historical release. One source file, `TurboQuant_QLauncher.py`, for Windows
 and Linux (platform behaviour is selected at runtime; Linux keeps its own
 `*_Linux` config, key, lock and results files).
 

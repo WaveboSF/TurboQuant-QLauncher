@@ -1,10 +1,13 @@
 # TurboQuant QLauncher
 
-**Model Switcher & Benchmark Tool for llama-server with TurboQuant Compression**
+**Local model launcher and benchmark GUI for llama.cpp / TurboQuant and Flash-Next / Strata**
 
-A lightweight desktop GUI for managing [llama-server](https://github.com/ggml-org/llama.cpp) with [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/). Launch models, switch KV configs, run benchmarks, monitor VRAM, and quick-switch between multiple llama-server builds — all without touching the command line.
+TurboQuant QLauncher provides a desktop interface for selecting models, configuring and starting inference servers, monitoring their status, and benchmarking with supported llama.cpp builds. It supports two independently developed engine paths:
 
-TurboQuant applies Walsh–Hadamard rotation to compress transformer data at very low bit widths. Originally designed for **KV-cache compression**, the community forks are now extending the same WHT rotation to **model weights** (post-training, no retraining required). QLauncher is agnostic to both: any GGUF file, any llama-server build, any cache type.
+- **llama.cpp / TurboQuant:** Use a compatible [llama.cpp](https://github.com/ggml-org/llama.cpp) server or a community fork. Some forks add TurboQuant KV-cache formats and other quantization features.
+- **Flash-Next / Strata:** Use the separate [Strata](https://github.com/Niko1221/Strata) engine with a configured compatible model profile, including supported Qwen3.8-Flash-Next variants.
+
+Supported models, quantizations, context settings and KV-cache types depend on the selected server, its build and the model. Inference engines and model weights are installed separately and retain their own licenses.
 
 **Current native launcher:** The native QLauncher is a Rust application. Use the project's native Linux or Windows release package when available; inference servers and models are installed separately. Real Windows hardware validation remains pending.
 
@@ -351,4 +354,4 @@ TurboQuant refers to the paper by Zandieh et al. ([arXiv:2504.19874](https://arx
 
 MIT — © WaveboSF 2026
 
-Built with assistance from Claude (Anthropic).
+Built with assistance from Claude (Anthropic) and [OpenAI Codex](https://openai.com/codex/).
