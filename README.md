@@ -17,6 +17,14 @@ Supported models, quantizations, context settings and KV-cache types depend on t
 To get started, download and extract the archive for your platform, then use **Paths** to configure the model folders and server.
 
 
+## Native 1.44 quick start
+
+1. Download the Linux or Windows package from [Releases](https://github.com/WaveboSF/TurboQuant-QLauncher/releases) and extract the entire archive.
+2. On Linux, start `./TurboQuant_QLauncher-Linux`; on Windows, start `TurboQuant_QLauncher-Windows.exe` after installing the [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist/).
+3. In **Paths**, select your model folders and a compatible inference server. Models and inference engines are separate downloads.
+
+**Backend compatibility check (16 November 2026):** Linux tests loaded one model across two compatible GPUs with llama.cpp v1.0.0 (b12359), TheTom `4185b90` and spiritbuun `1e50db7`. The two TurboQuant forks were also exercised with a `q8_0` / `turbo4` KV cache. This is a smoke test at 4,096 context tokens, not a guarantee for every model or configuration. The server builds tested here are not included in the QLauncher downloads. Strata 0.1.60 has not yet been tested with a model in this setup. Windows server testing remains separate.
+
 > **Historical documentation:** The features, setup instructions and commands below describe the older Python 1.37 launcher. They do not document the native release; its interface and behavior may differ. The Python reference uses the standard library and tkinter. See [CHANGELOG.md](CHANGELOG.md) for its historical changes.
 
 ![TurboQuant QLauncher screenshot with fictional example data](screenshot.png)
@@ -102,7 +110,7 @@ Forks known to work with QLauncher (the `<fork>` part of the build folder name i
 | Fork | Repository | Branch | Notes |
 |---|---|---|---|
 | `mainline` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | `master` | Upstream baseline. **No turbo KV types** — only `f16`, `q8_0`, `q4_0`. Use as a control. |
-| `thetom` | [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) | `feature/turboquant-kv-cache` | The reference TurboQuant integration. Adds `turbo2`/`turbo3`/`turbo4` KV types, Sparse V, weight quantization (TQ3_1S/TQ4_1S). MSVC needs the patches from issue #39. |
+| `thetom` | [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) | `feature/turboquant-kv-cache` | The reference TurboQuant integration. Adds `turbo2`/`turbo3`/`turbo4` KV types, Sparse V, weight quantization (TQ3_1S/TQ4_1S). For Windows build details, check the fork's current documentation and [issue #39](https://github.com/TheTom/llama-cpp-turboquant/issues/39). |
 | `madreag` | [Madreag/turbo3-cuda](https://github.com/Madreag/turbo3-cuda) | `release/cuda-optimized` | CUDA optimizations on top of the base TurboQuant implementation. |
 | `spiritbuun` | [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) | `master` | Independent fork with TurboQuant and TCQ work. |
 | `gemma4` | [llama-cpp-turboquant-gemma4](https://github.com/test1111111111111112/llama-cpp-turboquant-gemma4) | `feature/turboquant-kv-cache` | Gemma 4-specific turbo4 kernel optimizations for `D=256`/`D=512` head dimensions: lazy K/V, batch decode, warp-cooperative write. Built on top of the TheTom fork. |
@@ -301,7 +309,7 @@ After building, copy `llama-server.exe`, `llama-bench.exe` and the matching DLLs
 
 On **Linux** use the same `cmake` flags (with `\` instead of `^` as line continuation) and either copy the binaries and `.so` files into a named build folder or point a slot directly at `build/bin/llama-server` — in that case the slot label is taken from the project folder above `build/bin`.
 
-> 📅 **MSVC note (as of April 2026):** Building the TheTom fork on Windows currently needs a handful of manual patches (`M_PI` define, `extern` visibility fixes, etc.). Add `#define _USE_MATH_DEFINES` and `#include <math.h>` at the top of `ggml/src/ggml-turbo-quant.c` and see [issue #39](https://github.com/TheTom/llama-cpp-turboquant/issues/39) for the full set. These are likely to land upstream at some point — check the issue status before patching.
+> **Windows builds:** Consult the fork's current build instructions and [issue #39](https://github.com/TheTom/llama-cpp-turboquant/issues/39) for the status of any toolchain-specific workarounds.
 
 > **Multi-GPU note:** Set `CUDA_DEVICE_ORDER=PCI_BUS_ID` for correct GPU routing on mixed-architecture systems. QLauncher does this automatically for every server it launches.
 
