@@ -14,6 +14,9 @@ Supported models, quantizations, context settings and KV-cache types depend on t
 
 **Native 1.44 highlights:** Flash-Next / Strata integration; combined-GPU model loading with supported llama.cpp builds; an automatic compatibility notice that clears when the selected model is ready; configurable context; and a local-server browser button. Linux was exercised locally; Windows hardware validation is pending.
 
+To get started, download and extract the archive for your platform, then use **Paths** to configure the model folders and server.
+
+
 > **Historical documentation:** The features, setup instructions and commands below describe the older Python 1.37 launcher. They do not document the native release; its interface and behavior may differ. The Python reference uses the standard library and tkinter. See [CHANGELOG.md](CHANGELOG.md) for its historical changes.
 
 ![TurboQuant QLauncher screenshot with fictional example data](screenshot.png)
