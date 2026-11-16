@@ -927,17 +927,9 @@ DEFAULT_CONFIG = {
     # sobald das gewaehlte Modell NextN-Koepfe traegt (ModelInfo.has_nextn),
     # sonst nichts. "off" schaltet es ganz ab.
     #
-    # Bewusst KEIN Knopf in der Oberflaeche: Es gibt nichts abzuwaegen. MTP ist
-    # verlustfrei (Spekulation aendert die Ausgabe per Konstruktion nicht) und
-    # brachte am 2026-08-21 auf Qwen3.8-27B-Q6_K/RTX 5090 gemessen 103,0 gegen
-    # 58,5 tok/s, also 1,76x. Der einzige Grund, es NICHT zu setzen, ist ein
-    # Modell ohne NextN — und das entscheidet kein Nutzer, das steht in der
-    # Datei. Ein globaler Schalter waere sogar gefaehrlich: auf einem Modell
-    # ohne die Koepfe bricht llama-server mit Exit 1 ab.
-    #
-    # Der Schluessel bleibt als Notausgang, falls MTP einmal stoert — etwa auf
-    # einem bildlastigen Pfad, wo der Prompt-Aufpreis (+26,6 ms je Anfrage,
-    # gemessen 2026-08-20) den Generierungsgewinn auffrisst.
+    # MTP is selected from model metadata. A model without NextN heads cannot
+    # use this option, so the launcher does not enable it indiscriminately.
+    # The setting remains available as an escape hatch when needed.
     "mtp_mode": "auto",
     "last_model": "",
     "last_gpu_key": "",
@@ -1709,16 +1701,8 @@ def detect_all_gpus() -> List[GPUInfo]:
 def short_gpu_name(name: str) -> str:
     """Strip marketing filler from a GPU name for the header line.
 
-    AP-QL-78 (Delta-Audit 03.08., Fund F): woertlich aus der archivierten
-    Windows-Linie zurueckgeholt. Ohne sie stand in der Kopfzeile
-    "NVIDIA GeForce RTX 5090" — bei zwei Karten rund 16 Zeichen mehr in
-    einer Zeile, die sich GPU, RAM, CUDA, Build und Laufzeit teilt.
-
-    v0.65: the header packs GPU, RAM, CUDA, build and runtime into one
-    line, so every character counts — "NVIDIA GeForce RTX 5090" says
-    nothing "NVIDIA RTX 5090" doesn't. Only the vendor's series word is
-    dropped; the model number, which is the part that identifies the
-    card, is left untouched. AMD/Intel names pass through unchanged.
+    For example, the fictional name "NVIDIA GeForce GPU 1" becomes
+    "NVIDIA GPU 1". The model identifier is retained.
 
     Args:
         name: Raw GPU name as reported by the vendor tool.
@@ -1731,28 +1715,12 @@ def short_gpu_name(name: str) -> str:
 
 
 def _clean_wmi_gpu_name(raw: str) -> str:
-    """Turn WMI's verbose VideoController Name into something short and
-    readable for the model-card label column.
+    """Shorten a WMI VideoController name for a model-card label.
 
-    AP-QL-76 (Delta-Audit 03.08., Fund D): woertlich aus der archivierten
-    Windows-Linie zurueckgeholt. Das Linux-Gegenstueck
-    _clean_lspci_gpu_name kam beim Zusammenlegen mit, dieses hier ging
-    verloren — der WMI-Zweig nahm seitdem den Rohnamen, der in der
-    Beschriftungsspalte abgeschnitten wurde.
-
-    WMI Name field examples:
-      "NVIDIA GeForce RTX 5090"              -> "GeForce RTX 5090"
-      "AMD Radeon RX 7900 XTX"               -> "Radeon RX 7900 XTX"
-      "AMD Radeon(TM) Graphics"              -> "Radeon iGPU"       (APU)
-      "Intel(R) UHD Graphics 770"  -> "Intel UHD Graphics 770"      (iGPU)
-      "Intel(R) Iris(R) Xe Graphics"         -> "Intel Iris Xe"     (iGPU)
-      "Intel(R) Arc(TM) A770 Graphics"       -> "Intel Arc A770"    (discrete)
-
-    Zur UHD-Zeile: die Vorlage behauptete dort "Intel UHD 770". Das war
-    schon in der archivierten Linie falsch — die Regel streicht "Graphics"
-    nur am ZEILENENDE, und hier folgt noch die Modellnummer. Gemessen am
-    03.08. beim Rueckport (AP-QL-76) und hier auf den tatsaechlichen Wert
-    berichtigt; das VERHALTEN ist unveraendert woertlich uebernommen.
+    Fictional examples:
+      "NVIDIA GeForce GPU 1" -> "GeForce GPU 1"
+      "AMD Radeon GPU 2" -> "Radeon GPU 2"
+      "Intel(R) iGPU 1" -> "Intel iGPU 1"
     """
     import re
     s = raw
@@ -1795,23 +1763,15 @@ def _clean_wmi_gpu_name(raw: str) -> str:
     return s or raw[:28]
 
 def _clean_lspci_gpu_name(raw: str) -> str:
-    """Turn lspci's verbose GPU name into something short and readable.
+    """Shorten an lspci GPU name for a model-card label.
 
-    lspci raw output examples:
-      "Advanced Micro Devices, Inc. [AMD/ATI] Raphael (rev c2)"
-        -> "Radeon (Raphael)"
-      "Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]"
-        -> "Radeon RX 7900 XTX"
-      "Intel Corporation Raptor Lake-S UHD Graphics (rev 04)"
-        -> "Intel UHD Graphics (Raptor Lake-S)"
-      "NVIDIA Corporation GA102 [GeForce RTX 3090]"
-        -> "GeForce RTX 3090"
+    Examples can use fictional identifiers such as GPU 1, GPU 2 and iGPU 1.
     """
     import re
     s = raw
     # Drop "(rev XX)" suffix
     s = re.sub(r"\s*\(rev [^)]+\)\s*$", "", s)
-    # Prefer the bracketed product name if present: "... [Radeon RX 7900 XTX]"
+    # Prefer the bracketed product name if present, e.g. "... [Radeon GPU 2]".
     bracketed = re.findall(r"\[([^\]]+)\]", s)
     for b in bracketed:
         bl = b.lower()
@@ -7971,13 +7931,8 @@ class TurboQuantQLauncher(tk.Tk):
             except Exception:
                 pass
         self._unload_btns = {}
-        # ⚠ Nur Karten, auf denen ueberhaupt ein Server laufen kann. Auf
-        # dieser Maschine meldet die Erkennung DREI Geraete -- RTX 5090,
-        # RTX 4090 und eine Intel UHD 770 mit 0 MB. Der Launcher startet
-        # ausschliesslich ueber CUDA_VISIBLE_DEVICES, also kann dort nie
-        # etwas von uns liegen: ein "Unload 2" waere ein Knopf, der nichts
-        # tun kann. Dieselbe Haltung wie AP-QL-105, das Knoepfe weglaesst,
-        # die es nicht einloesen koennte.
+        # Only offer unload buttons for NVIDIA devices the launcher can use.
+        # Other detected devices cannot own a server started via CUDA.
         gpus = [g for g in (self.gpus or []) if g.vendor == "nvidia"]
         for g in gpus:
             label = "Unload" if len(gpus) == 1 else f"Unload {g.index}"
@@ -9131,7 +9086,7 @@ class TurboQuantQLauncher(tk.Tk):
 
     # ─── Keyboard Navigation ─────────────────────────────────────────────
     # Up/Down navigate linearly through ALL rows of the flat list:
-    # RTX5090 → RTX4090 → CPU RAM → (next model) RTX5090 → ...
+    # GPU A → GPU B → CPU RAM → (next model) GPU A → ...
     # Without this, pressing Down from row 0 of model A would jump to
     # row 0 of model B, skipping the CPU RAM row entirely.
     # Left/Right still move only within the current model (useful when
@@ -10304,18 +10259,11 @@ class TurboQuantQLauncher(tk.Tk):
         # ────────────────────────────────────────────────────────────────
         # AP-QL-85: Multi-Token Prediction, an das MODELL gebunden.
         #
-        # Bis hierher setzte QLauncher --spec-type nie — der produktiv
-        # gestartete Server lief also ohne MTP, waehrend die Startzeile im
-        # Handover es von Hand mitgab. Das kostete gemessen den Faktor 1,76
-        # (103,0 gegen 58,5 tok/s, Qwen3.8-27B-Q6_K auf der RTX 5090,
-        # 2026-08-21).
-        #
         # has_nextn kommt aus dem GGUF selbst (_detect_model_traits). Damit
         # kann das Flag nicht global gesetzt werden, und genau darauf kam es
         # an: auf einem Modell ohne NextN-Koepfe bricht llama-server mit
         # Exit 1 ab ("context type MTP requested but model doesn't contain
-        # MTP layers"). Die Tiefe bleibt beim Server-Default 3 — gemessen das
-        # Optimum (68,3 tok/s gegen 62,9 bei 1 und 61,1 bei 5).
+        # MTP layers"). Die Tiefe bleibt beim Server-Default.
         if self.cfg.get("mtp_mode", "auto") == "auto" and model.has_nextn:
             cmd.extend(["--spec-type", "draft-mtp"])
             self._log(
@@ -10598,9 +10546,7 @@ class TurboQuantQLauncher(tk.Tk):
         A configured value wins. Without one, the default is "not the card the
         primary server is on" — the two run side by side, and putting both on
         the same GPU is the one arrangement that reliably runs it out of
-        memory. Measured on this machine 2026-08-21: the brain holds ~27 GB of
-        the 5090's 32.6 GB, so a second model there has nowhere to go, while
-        the 4090 sits at 4.3 GB of 24.5 GB.
+        memory.
         """
         configured = str(self.cfg.get("vision_gpu_key") or "").strip()
         if configured:
@@ -11241,13 +11187,9 @@ class TurboQuantQLauncher(tk.Tk):
     # ⚙ Owner: "überprüfe dann bei jedem Start um welche GPU es sich dann
     # exakt handelt."
     #
-    # Der Anlass ist gemessen: `CUDA_VISIBLE_DEVICES=0` allein trifft auf
-    # dieser Maschine die **4090**, nicht die 5090 -- ohne
-    # `CUDA_DEVICE_ORDER=PCI_BUS_ID` gilt die CUDA-Voreinstellung
-    # FASTEST_FIRST, und die ordnet anders als nvidia-smi. Der Launcher setzt
-    # PCI_BUS_ID seit jeher, aber niemand hat je NACHGESEHEN. Ein
-    # Messwerkzeug ohne die Variable hat am 17.09. zwei Wochen lang
-    # 4090-Zahlen unter der Ueberschrift "RTX 5090" geliefert.
+    # CUDA and nvidia-smi may enumerate the same GPUs in different orders.
+    # Explicit PCI bus ordering and process-level verification avoid confusing
+    # the selected device with a different card.
     #
     # ⚠ Gefragt wird die PID, NICHT der Serverlog. Der erste Entwurf las
     # "Device 0: <name>" aus der Ausgabe -- diese Zeile erscheint bei

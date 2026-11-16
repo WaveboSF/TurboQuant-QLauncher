@@ -6,11 +6,15 @@ A lightweight desktop GUI for managing [llama-server](https://github.com/ggml-or
 
 TurboQuant applies Walsh–Hadamard rotation to compress transformer data at very low bit widths. Originally designed for **KV-cache compression**, the community forks are now extending the same WHT rotation to **model weights** (post-training, no retraining required). QLauncher is agnostic to both: any GGUF file, any llama-server build, any cache type.
 
-Zero external dependencies. Python stdlib + tkinter only. Current version: **v1.37** (see [CHANGELOG.md](CHANGELOG.md)).
+**Current native launcher:** The native QLauncher is a Rust application. Use the project's native Linux or Windows release package when available; inference servers and models are installed separately. Real Windows hardware validation remains pending.
 
-> **Developer repository — source only.** This repository contains the Python source, the Linux start script, the manual and a screenshot — no pre-built executables, no binaries. One file, `TurboQuant_QLauncher.py`, runs on both Windows and Linux; the platform-specific behaviour is chosen at runtime.
+**Native 1.44 highlights:** multi-GPU selection for supported NVIDIA devices; a compatibility notice that clears when the selected model is ready; configurable context; a local-server browser button; and updated credits and dependency notices. Linux was exercised locally; Windows hardware validation is pending.
 
-![TurboQuant QLauncher Screenshot](screenshot.png)
+> **Historical documentation:** The features, setup instructions and commands below describe the older Python 1.37 launcher. They do not document the native release; its interface and behavior may differ. The Python reference uses the standard library and tkinter. See [CHANGELOG.md](CHANGELOG.md) for its historical changes.
+
+![TurboQuant QLauncher screenshot with fictional example data](screenshot.png)
+
+*The screenshot uses fictional devices, capacities and models.*
 
 ---
 
@@ -92,11 +96,11 @@ Forks known to work with QLauncher (the `<fork>` part of the build folder name i
 |---|---|---|---|
 | `mainline` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | `master` | Upstream baseline. **No turbo KV types** — only `f16`, `q8_0`, `q4_0`. Use as a control. |
 | `thetom` | [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) | `feature/turboquant-kv-cache` | The reference TurboQuant integration. Adds `turbo2`/`turbo3`/`turbo4` KV types, Sparse V, weight quantization (TQ3_1S/TQ4_1S). MSVC needs the patches from issue #39. |
-| `madreag` | [Madreag/turbo3-cuda](https://github.com/Madreag/turbo3-cuda) | `master` | Aggressive CUDA kernel optimizations on top of the base TurboQuant implementation: LUT scoring, `nthreads_KQ=8`, sparse V skip. Reports +13–69% decode at 32K context across RTX 5090 / 4090 / 3090 / 3090 Ti. |
-| `spiritbuun` | [spiritbuun/llama-cpp-turboquant-cuda](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) | `feature/turboquant-kv-cache` | Independent CUDA fork with norm correction and inverse-FWHT prefill optimization. Originally validated on RTX 3090. |
-| `gemma4` | [llama-cpp-turboquant-gemma4](https://github.com/test1111111111111112/llama-cpp-turboquant-gemma4) | `master` | Gemma 4-specific turbo4 kernel optimizations for `D=256`/`D=512` head dimensions: lazy K/V, batch decode, warp-cooperative write. Built on top of the TheTom fork. |
+| `madreag` | [Madreag/turbo3-cuda](https://github.com/Madreag/turbo3-cuda) | `release/cuda-optimized` | CUDA optimizations on top of the base TurboQuant implementation. |
+| `spiritbuun` | [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) | `master` | Independent fork with TurboQuant and TCQ work. |
+| `gemma4` | [llama-cpp-turboquant-gemma4](https://github.com/test1111111111111112/llama-cpp-turboquant-gemma4) | `feature/turboquant-kv-cache` | Gemma 4-specific turbo4 kernel optimizations for `D=256`/`D=512` head dimensions: lazy K/V, batch decode, warp-cooperative write. Built on top of the TheTom fork. |
 
-> **Tip:** Set `CUDA_DEVICE_ORDER=PCI_BUS_ID` on mixed-architecture systems (e.g. RTX 5090 + RTX 4090). Without it, `CUDA_VISIBLE_DEVICES` can silently route to the wrong GPU. QLauncher does this automatically.
+> **Tip:** Set `CUDA_DEVICE_ORDER=PCI_BUS_ID` on systems with multiple NVIDIA GPU architectures. Without it, `CUDA_VISIBLE_DEVICES` can silently route to the wrong GPU. QLauncher does this automatically.
 
 ---
 
@@ -108,14 +112,12 @@ Keep every build in its own folder. The folder holds `llama-server` (Windows: `l
 llama-server_<fork>_<YYYY-MM-DD>_<build-or-commit>.<platform>
 ```
 
-Builds used and tested with v1.37:
+Illustrative build-folder examples (replace the placeholders with actual build details):
 
 | Folder | Footer label | Source |
 |---|---|---|
-| `llama-server_mainline_2026-09-12_b10919.windows` | `mainline_b10919` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
-| `llama-server_mainline_2026-10-06_b11457.linux` | `mainline_b11457` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
-| `llama-server_spiritbuun_2026-09-24_2acf5b10.linux` | `spiritbuun_2acf5b10` | [spiritbuun/llama-cpp-turboquant-cuda](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) |
-| `llama-server_thetom_2026-09-23_a3d5603d.linux` | `thetom_a3d5603d` | [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) |
+| `llama-server_mainline_<date>_<build>.linux` | `mainline_<build>` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
+| `llama-server_spiritbuun_<date>_<commit>.windows` | `spiritbuun_<commit>` | [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) |
 
 How QLauncher uses the folder name:
 
@@ -245,16 +247,16 @@ python TurboQuant_QLauncher.py --version
 
 ## Benchmark Output
 
-After a run, click **💾 Save Results…** in the footer to append the results as a Markdown table to `TurboQuant_Benchmark_results.md` (Linux: `TurboQuant_Benchmark_results_Linux.md`) — ready for GitHub posts:
+After a run, click **💾 Save Results…** in the footer to append the results as a Markdown table to `TurboQuant_Benchmark_results.md` (Linux: `TurboQuant_Benchmark_results_Linux.md`). The following numbers are illustrative placeholders, not measurements:
 
 ```markdown
-### model.gguf — RTX 4090, Build CUDA 12.8 (sm_89;120), Driver 13.2, 2026-04-04
+### model.gguf — Example GPU — Example build
 
 | KV-Cache          | pp512 (t/s) | tg128 (t/s) | Δ Prefill | Δ Decode |
 |-------------------|-------------|-------------|-----------|----------|
 | **LA=off**        |             |             |           |          |
-| f16 (default)     | 10,112.60   | 150.59      | —         | —        |
-| q8_0-K + turbo4-V | 10,808.36   | 136.37      | +6.9%     | -9.4%    |
+| f16 (default)     | 100.00      | 20.00       | —         | —        |
+| q8_0-K + turbo4-V | 105.00      | 19.00       | +5.0%     | -5.0%    |
 | ...               |             |             |           |          |
 ```
 
@@ -264,26 +266,7 @@ Each run includes model name, GPU, CUDA build version (sm targets), driver versi
 
 ## Benchmark Findings
 
-> 📅 **Snapshot: April 2026** — The numbers below are a point-in-time capture from a single hardware setup and a single fork build. TurboQuant kernels are being tuned weekly across all five forks, so individual figures and the "best config" recommendation can and will move. Use this as a reference shape, not as a current ranking. For the latest community results check [Discussion #20969](https://github.com/ggml-org/llama.cpp/discussions/20969).
-
-Tested on AMD 9950X3D · 64 GB DDR5 · RTX 5090 (32 GB) + RTX 4090 (24 GB).
-Build: spiritbuun `feature/turboquant-kv-cache` · CUDA 12.8 · `-DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON`.
-
-### Key Results — Meta-Llama-3.1-8B-Instruct-Q4_K_M · LA=1
-
-| Config | RTX 4090 (Ada, sm_89) | RTX 5090 (Blackwell, sm_120) |
-|---|---|---|
-| f16 baseline | 10,077 / 150.2 t/s | 12,761 / 231.9 t/s |
-| q8₀+t4 | +8.7% / **-6.9%** | -3.2% / **-25.2%** |
-| q8₀+t3 | +8.5% / **-8.2%** | -2.7% / **-30.2%** |
-| t3/t3 | +3.8% / **-14.9%** | -7.5% / **-39.7%** |
-
-### Notable Findings
-
-- **Ada (sm_89) currently handles TurboQuant decode significantly better than Blackwell (sm_120).** In this snapshot the RTX 4090 loses only ~7 % decode with q8₀+t4, while the RTX 5090 loses ~25 %. This matches the structural explanation that Ada's int8 `dp4a` instructions align well with the current TurboQuant dequant path — but Blackwell-specific kernels are an active work item, so expect this gap to close.
-- **LA=1 improves decode speed in addition to quality** on this build. The q8_0 layers at critical positions use the faster native int8 decode.
-- **CUDA 12.8 ≈ CUDA 13.2 on this hardware** for TurboQuant workloads. `sm_120a` provided no measurable benefit over `sm_120` in our test runs.
-- **Working recommendation on this setup:** `q8_0-K + turbo4-V` with `LA=1` — best balance of compression, speed, and quality *at the time of measurement*. Re-run the Bench All matrix after any fork update.
+Performance depends on the model, GPU, context, cache configuration and selected server build. Run measurements on the target system; see [Discussion #20969](https://github.com/ggml-org/llama.cpp/discussions/20969) for community findings.
 
 ---
 
@@ -292,20 +275,20 @@ Build: spiritbuun `feature/turboquant-kv-cache` · CUDA 12.8 · `-DGGML_CUDA_FA=
 The build flags below work for **any** of the supported TurboQuant forks. Just substitute the repository URL and branch from the [Supported Forks](#supported-forks) table. The example uses the spiritbuun fork:
 
 ```cmd
-git clone --branch feature/turboquant-kv-cache --depth 1 ^
-  https://github.com/spiritbuun/llama-cpp-turboquant-cuda.git
+git clone --branch master --depth 1 ^
+  https://github.com/spiritbuun/buun-llama-cpp.git
 
-cd llama-cpp-turboquant-cuda
+cd buun-llama-cpp
 
 cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON ^
   -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON ^
-  -DCMAKE_CUDA_ARCHITECTURES="89;120" ^
+  -DCMAKE_CUDA_ARCHITECTURES="<CUDA_ARCHITECTURES>" ^
   -DCMAKE_BUILD_TYPE=Release
 
 cmake --build build --config Release -j
 ```
 
-`CMAKE_CUDA_ARCHITECTURES="89;120"` builds for Ada (RTX 4090, sm_89) **and** Blackwell (RTX 5090, sm_120) in one binary. Drop one of the values if you only need a single architecture.
+Replace `<CUDA_ARCHITECTURES>` with the semicolon-separated architecture codes for the target GPUs. Consult NVIDIA and the fork documentation for the appropriate codes and toolchain.
 
 After building, copy `llama-server.exe`, `llama-bench.exe` and the matching DLLs into their own build folder (see [Organizing llama-server Builds](#organizing-llama-server-builds)), then add the `llama-server.exe` to a Quick-Switch slot in QLauncher → Paths. On Windows the header shows whether all required DLLs (including `cublas64_12/13.dll`) are present.
 
@@ -340,8 +323,10 @@ On **Linux** use the same `cmake` flags (with `\` instead of `^` as line continu
 - [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) — Upstream llama.cpp (mainline baseline)
 - [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) — Reference TurboQuant integration (`feature/turboquant-kv-cache`)
 - [Madreag/turbo3-cuda](https://github.com/Madreag/turbo3-cuda) — Aggressive CUDA kernel optimizations
-- [spiritbuun/llama-cpp-turboquant-cuda](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) — Independent CUDA fork with norm correction
+- [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) — Independent CUDA fork with norm correction
 - [llama-cpp-turboquant-gemma4](https://github.com/test1111111111111112/llama-cpp-turboquant-gemma4) — Gemma 4 D=256/512 head optimizations
+- [Niko1221/Strata](https://github.com/Niko1221/Strata) — independent inference engine and server
+- [turbo-tan/llama.cpp-tq3](https://github.com/turbo-tan/llama.cpp-tq3) — TQ weight formats and CUDA kernels
 
 **Other resources:**
 
