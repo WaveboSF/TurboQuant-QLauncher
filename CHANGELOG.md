@@ -12,8 +12,8 @@ License: MIT · © WaveboSF 2026
 
 ### Added and changed
 - Native Rust desktop packages for Linux and Windows; inference engines and models are configured separately.
-- Backend selection for llama.cpp / TurboQuant and supported Flash-Next / Strata profiles. Model and cache support depend on the selected backend and build.
-- `Comb.GPU` selection for compatible NVIDIA devices with a supporting server; the launcher rechecks the available devices before starting.
+- **Flash-Next / Strata:** Select the separate Strata backend for supported, configured model profiles alongside llama.cpp / TurboQuant. Model and cache support depend on the selected backend and build.
+- **Comb.GPU:** Distribute one model across compatible NVIDIA GPUs with a supporting llama.cpp server, using the available VRAM on each card. The launcher rechecks the devices before starting.
 - A tested compatibility fallback for a known model/build combination, with a notice during loading that clears when the selected model is ready.
 - Editable context size, clearer start and stop controls, and a button to open the local server in a browser.
 - Updated project credits, upstream references and license notices. Release packages exclude user configurations, models and inference-server binaries.

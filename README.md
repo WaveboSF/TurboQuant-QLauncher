@@ -6,12 +6,13 @@ TurboQuant QLauncher provides a desktop interface for selecting models, configur
 
 - **llama.cpp / TurboQuant:** Use a compatible [llama.cpp](https://github.com/ggml-org/llama.cpp) server or a community fork. Some forks add TurboQuant KV-cache formats and other quantization features.
 - **Flash-Next / Strata:** Use the separate [Strata](https://github.com/Niko1221/Strata) engine with a configured compatible model profile, including supported Qwen3.8-Flash-Next variants.
+- **Comb.GPU with llama.cpp:** Distribute a single model across compatible NVIDIA GPUs with a supporting server, using the available VRAM on each card.
 
 Supported models, quantizations, context settings and KV-cache types depend on the selected server, its build and the model. Inference engines and model weights are installed separately and retain their own licenses.
 
 **Current native launcher:** The native QLauncher is a Rust application. Use the project's native Linux or Windows release package when available; inference servers and models are installed separately. Real Windows hardware validation remains pending.
 
-**Native 1.44 highlights:** multi-GPU selection for supported NVIDIA devices; a compatibility notice that clears when the selected model is ready; configurable context; a local-server browser button; and updated credits and dependency notices. Linux was exercised locally; Windows hardware validation is pending.
+**Native 1.44 highlights:** Flash-Next / Strata integration; combined-GPU model loading with supported llama.cpp builds; an automatic compatibility notice that clears when the selected model is ready; configurable context; and a local-server browser button. Linux was exercised locally; Windows hardware validation is pending.
 
 > **Historical documentation:** The features, setup instructions and commands below describe the older Python 1.37 launcher. They do not document the native release; its interface and behavior may differ. The Python reference uses the standard library and tkinter. See [CHANGELOG.md](CHANGELOG.md) for its historical changes.
 
