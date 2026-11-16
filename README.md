@@ -20,6 +20,7 @@ To get started, download and extract the archive for your platform, then use **P
 ## Native 1.44 quick start
 
 1. Download the Linux or Windows package from [Releases](https://github.com/WaveboSF/TurboQuant-QLauncher/releases) and extract the entire archive.
+   Download and keep the [1.44 third-party license supplement](https://github.com/WaveboSF/TurboQuant-QLauncher/releases/download/v1.44/THIRD_PARTY_SUPPLEMENT_1.44.txt) with the package's existing licenses.
 2. On Linux, start `./TurboQuant_QLauncher-Linux`; on Windows, start `TurboQuant_QLauncher-Windows.exe` after installing the [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist/).
 3. In **Paths**, select your model folders and a compatible inference server. Models and inference engines are separate downloads.
 
@@ -364,6 +365,6 @@ TurboQuant refers to the paper by Zandieh et al. ([arXiv:2504.19874](https://arx
 
 ## License
 
-MIT — © WaveboSF 2026
+QLauncher itself: MIT — © WaveboSF 2026. Bundled third-party components carry their own licenses; see the package notices and the [1.44 license supplement](https://github.com/WaveboSF/TurboQuant-QLauncher/releases/download/v1.44/THIRD_PARTY_SUPPLEMENT_1.44.txt).
 
 Built with assistance from Claude (Anthropic) and [OpenAI Codex](https://openai.com/codex/).
