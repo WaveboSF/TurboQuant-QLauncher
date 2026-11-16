@@ -10,7 +10,7 @@ TurboQuant QLauncher provides a desktop interface for selecting models, configur
 
 Supported models, quantizations, context settings and KV-cache types depend on the selected server, its build and the model. Inference engines and model weights are installed separately and retain their own licenses.
 
-**Current native launcher:** The native QLauncher is a Rust application. Use the project's native Linux or Windows release package when available; inference servers and models are installed separately. Real Windows hardware validation remains pending.
+**Native binary packages for Linux and Windows:** The QLauncher is built in Rust and does not require a Python installation. Download the platform package from [Releases](https://github.com/WaveboSF/TurboQuant-QLauncher/releases); inference engines and models are installed separately. Real Windows hardware validation remains pending.
 
 **Native 1.44 highlights:** Flash-Next / Strata integration; combined-GPU model loading with supported llama.cpp builds; an automatic compatibility notice that clears when the selected model is ready; configurable context; and a local-server browser button. Linux was exercised locally; Windows hardware validation is pending.
 
