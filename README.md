@@ -4,17 +4,19 @@
 
 Choose a model, an inference server and a device in one window. QLauncher helps you manage server builds, context settings and benchmarks, and opens the local server in your browser.
 
-**[Download the latest Linux or Windows package](https://github.com/WaveboSF/TurboQuant-QLauncher/releases/latest)** · [Get a server build](#get-a-llama-server-build) · [What's new](CHANGELOG.md)
+**[Download QLauncher 1.53 for Linux or Windows](https://github.com/WaveboSF/TurboQuant-QLauncher/releases/latest)** · [Get a server build](#get-a-llama-server-build) · [What's new](CHANGELOG.md)
+
+Under **Assets**, choose `TurboQuant_QLauncher-Linux-1.53.tar.gz` for Linux or `TurboQuant_QLauncher-Windows-1.53.zip` for Windows. Extract the entire archive before starting.
+
+The launcher is a native Rust application; it does not require Python. **Models and inference servers are separate downloads.**
 
 ![TurboQuant QLauncher with an empty model list and generic device labels](screenshot.png)
-
-The current launcher is a native Rust application; it does not require Python. **Models and inference servers are separate downloads.**
 
 ## Quick start
 
 1. Download your platform's archive from [Releases](https://github.com/WaveboSF/TurboQuant-QLauncher/releases/latest) and extract the **entire folder**.
 2. Get a compatible [llama-server build](#get-a-llama-server-build) and a GGUF model, for example from [Hugging Face](https://huggingface.co/models?search=GGUF).
-3. Run `TurboQuant_QLauncher-Linux` on Linux or `TurboQuant_QLauncher-Windows.exe` on Windows.
+3. On Windows, double-click `TurboQuant_QLauncher-Windows.exe`. On Linux, open `TurboQuant_QLauncher-Linux` or run `./TurboQuant_QLauncher-Linux` in a terminal from the extracted folder.
 4. Open **Paths**. Add your model folder and select `llama-server` / `llama-server.exe`. To find several server builds, choose **Find server builds…** and select their parent folder. Save the settings.
 5. Select a model and a device, then press **Start**. Once the server is ready, **Browser** opens its local address.
 
