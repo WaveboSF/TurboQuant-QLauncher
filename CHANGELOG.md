@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.54
+
+- Added support for compatible Inkling profiles through separately installed [Xolotl](https://github.com/Indras-Mirror/Xolotl); tested on Linux, with Windows support not yet verified.
+- Highlight server builds with recognized support for the selected model and simplify server selection in Paths.
+- Match No Thinking and DFlash2 controls to the launcher buttons, and organize credits and licenses in a readable, movable window.
+
+Thanks to [Indras-Mirror and the Xolotl contributors](https://github.com/Indras-Mirror/Xolotl) for their work.
+
 ## 1.53
 
 - Optional DFlash2 acceleration for compatible Ripple models, with a Q4 draft and per-device context estimation.
